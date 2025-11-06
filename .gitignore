@@ -1,0 +1,122 @@
+########################
+# Python
+########################
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*/__pycache__/
+*/*/__pycache__/
+*/*/*/__pycache__/
+*.pyc
+*/*.pyc
+*/*/*.pyc
+*/*/*/*.pyc
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.python-env/
+.python_env/
+
+# Packaging / build
+build/
+dist/
+.eggs/
+*.egg-info/
+*.egg
+
+# Jupyter
+.ipynb_checkpoints/
+
+########################
+# Data / outputs
+########################
+
+# Common raw / export / cache data formats
+*.csv
+*.tsv
+*.parquet
+*.feather
+*.h5
+*.hdf5
+*.json
+*.xlsx
+*.xls
+*.sav
+*.dta
+*.rds
+*.rdata
+*.npz
+*.npy
+*.csv
+
+# Typical data / results folders
+data/
+datasets/
+output/
+outputs/
+results/
+reports/
+tmp/
+temp/
+.cache/
+
+########################
+# Logs
+########################
+
+*.log
+logs/
+log/
+
+########################
+# IDE / editor
+########################
+
+# VS Code
+.vscode/
+
+# PyCharm / IntelliJ
+.idea/
+*.iml
+
+# Other editor junk
+*.swp
+*.swo
+*.orig
+*~
+
+########################
+# OS-specific
+########################
+
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+########################
+# R / rpy2
+########################
+
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+*.Rproj
+
+########################
+# Testing / coverage
+########################
+
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+pytest_cache/
+.mypy_cache/
+.pytest_cache/
