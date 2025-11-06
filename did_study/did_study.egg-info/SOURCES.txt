@@ -1,0 +1,9 @@
+LICENSE
+README.md
+pyproject.toml
+setup.cfg
+src/did_study.egg-info/PKG-INFO
+src/did_study.egg-info/SOURCES.txt
+src/did_study.egg-info/dependency_links.txt
+src/did_study.egg-info/requires.txt
+src/did_study.egg-info/top_level.txt

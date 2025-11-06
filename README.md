@@ -1,0 +1,53 @@
+# did_study
+
+**did_study** is a modular Python toolkit for performing modern difference‑in‑differences (DiD) analyses.  It is designed for applications with staggered treatment adoption and implements the collapsed regression estimator for the Average Treatment on the Treated (ATT^o) proposed by Callaway and Sant’Anna (2024).  The package supports pooled and binned treatment effect estimation, robust event study regressions with two‑way fixed effects, wild cluster bootstrap inference when clusters are few, pre‑trend assessments, and summary reporting.
+
+## Features
+
+- **Panel construction** – quickly build a panel data set from raw longitudinal data.  The panel preparation routines collapse or retain sectoral units, compute time‑varying doses, derive treatment indicators, construct event time variables, transform outcomes (levels/logs and differences), engineer covariates (including principal components on energy demand) and trim units with insufficient support.
+- **ATT^o estimation** – estimate the aggregated ATT^o parameter as a collapsed regression or separately by dose bin.  Compute analytic and bootstrap standard errors and minimum detectable effects.
+- **Event study** – run event study regressions with two‑way fixed effects, optionally including covariates.  Includes joint pre‑trend tests and fallback slope tests with optional wild cluster bootstrap inference.
+- **Wild cluster bootstrap** – integrate the `fwildclusterboot` R package (via rpy2) to compute p‑values that are robust when there are few clusters.  Automatically chooses between Webb and Rademacher weight distributions based on the number of clusters.
+- **Reporting** – generate concise textual summaries of panel support, pooled and binned treatment effects, event study coefficients, MDEs and pre‑trend p‑values.
+
+## Installation
+
+The package can be installed from source.  First clone or download the repository and then run:
+
+```bash
+pip install .
+```
+
+The main dependencies are `pandas`, `numpy`, `statsmodels`, `scikit‑learn`, `tqdm`, and `rpy2` (for the wild cluster bootstrap).  See `setup.py` for the full list.
+
+## Quick start
+
+```python
+from did_study import StudyConfig, DidStudy
+import pandas as pd
+
+# Load your raw data as a pandas DataFrame.  The DataFrame must contain
+# columns for country, sector, year, outcome, capacity/dose and any
+# covariates.  See the examples in the documentation for details.
+
+config = StudyConfig(
+    df=my_data,
+    outcome_mode="direct",       # or "total"
+    covariates=["renewable_to_fossil_supply_ratio"],
+    n_bins=3,                     # discretize doses into quantile bins
+    use_wcb=True,                 # enable wild cluster bootstrap inference
+    wcb_B=4999,
+)
+
+study = DidStudy(config)
+results = study.run()
+
+from did_study.reporting import print_study_summary
+print_study_summary(results)
+```
+
+For more advanced usage, including custom dose bins, mapping weights, lagged covariates and pre/post support optimisation, see the API documentation in the source code.
+
+## License
+
+This project is licensed under the terms of the MIT license.  See the `LICENSE` file for details.
