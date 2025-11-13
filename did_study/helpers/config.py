@@ -62,7 +62,7 @@ class StudyConfig:
     dose_bins_right_closed: bool = False
     # Option B: explicit quantiles in [0,1], e.g. [0, 1/3, 2/3, 1]
     dose_quantiles: Optional[List[float]] = None
-    # Option C: convenience — set n_bins and we compute equal-frequency bins
+    # Option C: convenience - set n_bins and we compute equal-frequency bins
     # on post-treated, positive dose. (Handled in PanelData._prepare)
     n_bins: Optional[int] = None
 
@@ -78,6 +78,7 @@ class StudyConfig:
     pre: int = 5
     post: int = 10
     min_cluster_support: int = 2
+    cluster_col : list[str] = ("Country", "CCUS_sector")
 
     # Wild Cluster Bootstrap (WCB) selector
     use_wcb: bool = True

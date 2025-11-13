@@ -1,578 +1,525 @@
-"""
-Bins and binned ATT^o estimation utilities.
-
-This module provides helpers to build economically meaningful dose bins and
-estimate bin-specific ATT^o in a single, collapsed two‑way FE regression:
-
-    y_it = sum_{b in B+} beta_b * 1{dose_bin_i,t = b} + X'_{it} gamma
-            + alpha_i + tau_t + e_it,
-
-where the baseline category is the "untreated" (or zero‑dose) bin. Coefficients
-beta_b are interpreted as average treatment effects at bin b relative to
-untreated, controlling for unit and time fixed effects (alpha_i, tau_t).
-
-Key implementation choices
---------------------------
-1) We force `dose_bin` to be an ordered *string* categorical (NOT pandas.Interval)
-   to avoid rpy2 / design-matrix edge cases and collinearity issues stemming from
-   auto-generated variable names. We also sanitize dummy names.
-
-2) By default we estimate via statsmodels OLS with two‑way FE absorbed using
-   categorical dummies (C(unit), C(year)) and cluster‑robust SEs at `cluster_col`.
-   If the `linearmodels` package is available, we use PanelOLS with entity & time
-   effects for speed and numerical stability.
-
-3) Optional: if a local `.wcb` module is available (your project’s wrapper), we
-   will also compute Wild Cluster Bootstrap (WCB) p‑values for each bin.
-
-Returns a tidy table suitable for printing and plotting.
-
-Author: your_name_here
-"""
+# did_study/estimators/bins.py
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Tuple, Dict, Any
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
+import re
 import numpy as np
 import pandas as pd
-
-# Try optional dependencies
-try:  # linearmodels for fast FE
-    from linearmodels.panel import PanelOLS  # type: ignore
-    _HAVE_LM = True
-except Exception:  # pragma: no cover - optional
-    _HAVE_LM = False
-
 import statsmodels.formula.api as smf
-import statsmodels.api as sm
 
 from ..helpers.config import StudyConfig
+from ..helpers.utils import log_wcb_call, resolve_fe_terms
+from ..robustness.wcb import FitSpec, TestSpec, WildClusterBootstrap
 from ..robustness.stats.mde import analytic_mde_from_se
 
-# Optional WCB bridge (kept very light-weight and *truly* optional)
-try:
-    from ..robustness.wcb import wcb_att_pvalue_r  # type: ignore
-    _HAVE_WCB = True
-except Exception:  # pragma: no cover - optional
-    _HAVE_WCB = False
+if TYPE_CHECKING:  # pragma: no cover
+    from ..helpers.preparation import PanelData
+
+Number = Union[int, float]
 
 
-# ---------------------------------------------------------------------------
-# Utilities
-# ---------------------------------------------------------------------------
-
-def _is_interval_dtype(s: pd.Series) -> bool:
-    return pd.api.types.is_interval_dtype(s)
-
-
-def _sanitize_bin_label(x: Any) -> str:
-    """Convert any bin label to a safe short token for column names.
-
-    Examples
-    --------
-    "[0.5, 1.0)" -> "b_0p5_1p0"
-    "(1, 5]"      -> "b_1_5"
-    0             -> "b0"
-    None          -> "untreated"
-    "untreated"   -> "untreated"
-    """
-    if x is None or (isinstance(x, float) and np.isnan(x)):
-        return "untreated"
-    s = str(x).strip()
-    s = s.replace("∞", "inf").replace("-∞", "-inf")
-    # Replace punctuation with underscores
-    for ch in ["[", "]", "(", ")", ",", ":", ";", " ", "-", "+", "/", "\\", "|"]:
-        s = s.replace(ch, "_")
-    s = s.replace(".", "p")
-    # Collapse multiple underscores
-    while "__" in s:
-        s = s.replace("__", "_")
-    s = s.strip("_")
-    if not s:
-        s = "untreated"
-    # Ensure starts with letter
-    if not s[0].isalpha():
-        s = "b_" + s
-    return s
+def _sanitize_bin_label(label: str) -> str:
+    """Convert arbitrary bin labels into safe column-name fragments."""
+    safe = re.sub(r"[^0-9A-Za-z]+", "_", label)
+    safe = safe.strip("_")
+    if not safe:
+        safe = "bin"
+    return safe
 
 
-def _as_ordered_categorical(series: pd.Series, untreated_label: str = "untreated") -> pd.Categorical:
-    """Ensure an ordered categorical with `untreated_label` as the first category.
-
-    Accepts strings, numbers, or pandas.Interval. Converts all to strings.
-    """
-    if _is_interval_dtype(series):
-        # Convert Interval to string labels to avoid rpy2/design-matrix issues
-        values = series.astype(str)
-    else:
-        values = series.astype(object).where(series.notna(), other=untreated_label).astype(str)
-
-    # If any value equals "nan" (from astype), coerce to untreated
-    values = values.replace({"nan": untreated_label})
-
-    cats = pd.Index(pd.unique(values))
-    # Put untreated first if present
-    if untreated_label in cats:
-        ordered = [untreated_label] + [c for c in cats if c != untreated_label]
-    else:
-        ordered = list(cats)
-    return pd.Categorical(values, categories=ordered, ordered=True)
+def _series_from_result(values: Any, model: Any, prefix: str) -> pd.Series:
+    """Wrap statsmodels arrays into Series with sensible names."""
+    if isinstance(values, pd.Series):
+        return values
+    names = getattr(model, "exog_names", None) or getattr(getattr(model, "data", None), "xnames", None)
+    if names is None:
+        names = [f"{prefix}{i}" for i in range(len(values))]
+    return pd.Series(values, index=list(names))
 
 
-
-def _bin_categorical(
-    series: pd.Series | pd.DataFrame | Iterable,
-    *,
-    untreated_label: str = "untreated",
-    order: Optional[List[str]] = None,
-) -> pd.Categorical:
-    """
-    Convert a 'dose_bin'-like input into an **ordered** string categorical.
-    Accepts Series, single-col DataFrame, numpy array, or list.
-    NA -> untreated_label. Works for Interval dtype (stringifies cleanly).
-    """
-    s = _ensure_series(series)
-    obj = s.astype(object).where(s.notna(), other=untreated_label)
-    values = obj.astype(str)  # Intervals stringify fine here
-
-    cats_obs = pd.Index(pd.unique(values))
-
-    if order:
-        ordered = [c for c in order if c in set(cats_obs)]
-        cats = pd.Index(ordered) if ordered else cats_obs
-    else:
-        cats = cats_obs
-
-    return pd.Categorical(values, categories=cats, ordered=True)
-
-
-# ---------------------------------------------------------------------------
-# Public helpers to create bins
-# ---------------------------------------------------------------------------
+# ======================================================================
+# Helper: construct human-readable dose bins
+# ======================================================================
 
 def make_dose_bins(
     df: pd.DataFrame,
-    *,
     dose_col: str,
-    edges: Optional[Iterable[float]] = None,
-    quantiles: Optional[Iterable[float]] = None,
+    edges: Optional[Sequence[Number]] = None,
+    quantiles: Optional[Sequence[float]] = None,
     include_untreated: bool = True,
     untreated_label: str = "untreated",
     right: bool = False,
     precision: int = 2,
-    label_fmt: str = "[{left}, {right})",
-) -> pd.Series:
-    """Create dose bins as an ordered *string* categorical.
-
-    Either provide explicit `edges` (including min/max) or `quantiles`.
-
-    - If `include_untreated` is True, rows with dose <= 0 (or NaN) get the
-      `untreated_label` and are excluded from positive binning.
-    - For quantiles, we compute on strictly positive doses only.
-
-    Returns a pd.Categorical of labels with `untreated_label` first.
+) -> pd.Categorical:
     """
-    s = df[dose_col].copy()
-    s_pos = s.where(s > 0, other=np.nan)
+    Create a categorical dose-bin variable.
 
+    This is the function used by PanelData._bin_dose_absorbing, which
+    calls it like:
+
+        make_dose_bins(
+            g,
+            dose_col="dose_level",
+            edges=edges_used,
+            quantiles=None,
+            include_untreated=False,
+            untreated_label="untreated",
+            right=cfg.dose_bins_right_closed,
+            precision=2,
+        )
+
+    Parameters
+    ----------
+    df :
+        DataFrame containing the dose column.
+    dose_col :
+        Name of the column with the (continuous) dose variable.
+    edges :
+        Explicit bin edges (including lower and upper bounds).
+        Example: [0.1, 0.5, 2.0, np.inf].
+    quantiles :
+        Alternatively, a sequence of quantiles in (0, 1) to be used as
+        bin edges (on the *positive* part of the dose distribution).
+        Only one of `edges` or `quantiles` should be supplied.
+    include_untreated :
+        If True, observations with non-positive (or missing) dose get
+        their own “untreated” bin label. If False, they stay as NaN.
+    untreated_label :
+        Label used for the untreated bin.
+    right :
+        Whether the intervals are right-closed (like pandas.cut).
+    precision :
+        Number of decimals to display in bin labels.
+
+    Returns
+    -------
+    pd.Categorical
+        Categorical series of the same length as df.index, with
+        ordered bin labels.
+    """
     if edges is not None and quantiles is not None:
-        raise ValueError("Provide either `edges` or `quantiles`, not both.")
+        raise ValueError("Specify either 'edges' or 'quantiles', not both.")
 
-    pos_labels: pd.Series
-    if edges is not None:
-        edges = list(edges)
-        if any(np.isnan(edges)):
-            raise ValueError("`edges` contains NaNs.")
-        if sorted(edges) != list(edges):
-            raise ValueError("`edges` must be sorted.")
-        # Apply to positive doses only
-        pos_labels = pd.cut(s_pos, bins=edges, right=right, include_lowest=True)
-    elif quantiles is not None:
-        q = sorted(set(quantiles))
-        # Compute quantiles on positive values only
-        pos_vals = s_pos.dropna()
-        if len(pos_vals) == 0:
-            pos_labels = pd.Series(pd.Categorical([np.nan] * len(s)), index=s.index)
-        else:
-            qs = np.unique(np.clip(q, 0.0, 1.0))
-            cuts = list(np.unique(np.quantile(pos_vals, qs)))
-            cuts = sorted(set(cuts))
-            if len(cuts) <= 1:
-                pos_labels = pd.Series(pd.Categorical([np.nan] * len(s)), index=s.index)
-            else:
-                pos_labels = pd.cut(s_pos, bins=cuts, right=right, include_lowest=True)
+    dose = df[dose_col].astype(float)
+
+    # Treated portion (strictly positive dose)
+    mask_pos = dose > 0
+    treated = dose[mask_pos]
+
+    if edges is None and quantiles is None:
+        raise ValueError("Either 'edges' or 'quantiles' must be provided.")
+
+    if edges is None:
+        # Use quantiles on the positive part
+        qs = np.unique(quantiles)
+        if qs[0] <= 0 or qs[-1] >= 1:
+            raise ValueError("Quantiles should lie strictly between 0 and 1.")
+        finite_vals = treated.replace([np.inf, -np.inf], np.nan).dropna()
+        q_vals = finite_vals.quantile(qs).values
+        q_vals = np.unique(q_vals)
+        edges_arr = np.concatenate(([finite_vals.min()], q_vals, [finite_vals.max()]))
     else:
-        raise ValueError("You must provide `edges` or `quantiles`.")
+        edges_arr = np.asarray(edges, dtype=float)
 
-    # Build human-readable labels like "[0.00, 1.00)"
-    def _lab(iv: Any) -> Optional[str]:
-        if pd.isna(iv):
-            return None
-        if isinstance(iv, pd.Interval):
-            left = round(float(iv.left), precision)
-            right_ = round(float(iv.right), precision)
-            br_l = "(" if iv.open_left else "["
-            br_r = ")" if iv.open_right else "]"
-            return label_fmt.format(left=left, right=right_).replace("[", br_l).replace("]", br_r)
-        return str(iv)
+    # Defensive: require at least two finite edges
+    if len(edges_arr) < 2:
+        raise ValueError("At least two bin edges are required.")
 
-    labels_str = pos_labels.astype(object).map(_lab)
+    # Build labels like "[0.1, 0.5)" or "(0.5, 2.0]"
+    labels: List[str] = []
+    for lo, hi in zip(edges_arr[:-1], edges_arr[1:]):
+        if np.isinf(hi):
+            hi_str = "inf"
+        else:
+            hi_str = f"{hi:.{precision}f}".rstrip("0").rstrip(".")
+
+        if np.isinf(lo):
+            lo_str = "-inf"
+        else:
+            lo_str = f"{lo:.{precision}f}".rstrip("0").rstrip(".")
+
+        if right:
+            lab = f"({lo_str}, {hi_str}]"
+        else:
+            lab = f"[{lo_str}, {hi_str})"
+        labels.append(lab)
+
+    # Cut treated observations
+    treated_bins = pd.cut(
+        treated,
+        bins=edges_arr,
+        labels=labels,
+        right=right,
+        include_lowest=True,
+        ordered=True,
+    )
+
+    # Initialize all as NaN, then fill treated
+    out = pd.Series(pd.Categorical([np.nan] * len(df), categories=labels, ordered=True),
+                    index=df.index)
+
+    out.loc[mask_pos] = treated_bins.astype("category")
 
     if include_untreated:
-        lbl = labels_str.where((s_pos > 0) & labels_str.notna(), other=untreated_label)
-    else:
-        lbl = labels_str
+        # Add an explicit "untreated" category and assign to non-positive dose
+        categories = [untreated_label] + labels
+        out = out.cat.add_categories([untreated_label])  # type: ignore[arg-type]
+        out.loc[~mask_pos] = untreated_label
+        out = out.astype(pd.CategoricalDtype(categories=categories, ordered=True))
 
-    return _as_ordered_categorical(lbl, untreated_label=untreated_label)
+    return out.astype("category")
 
 
-# ---------------------------------------------------------------------------
-# Estimation: bin-specific ATT^o
-# ---------------------------------------------------------------------------
+# ======================================================================
+# Binned ATT estimation
+# ======================================================================
 
 @dataclass
 class BinAttResult:
-    table: pd.DataFrame
-    model: Any
-    used: pd.DataFrame
-    name_map: Dict[str, str]
-    baseline: str = "untreated"
+    """
+    Result object for bin-level ATT estimation.
+    """
+    bin_names: List[str]
+    coef: pd.Series
+    se: pd.Series
+    p_value: pd.Series
+    n_obs: int
+    n_treated_bins: pd.Series
+    mde: Optional[pd.Series] = None
+    joint_test_pvalue: Optional[float] = None
+    p_value_wcb: Optional[pd.Series] = None
+    cluster_counts: Optional[pd.Series] = None
+
+
+def _bin_categorical(
+    df: pd.DataFrame,
+    bin_col: str,
+    reference: Optional[str] = None,
+) -> Tuple[pd.DataFrame, List[str], Dict[str, str]]:
+    """
+    Turn a categorical bin variable into dummy regressors with safe column names.
+
+    Returns
+    -------
+    (df_with_dummies, dummy_names, label_map)
+      - dummy_names are safe column identifiers added to df.
+      - label_map maps dummy_name -> original human-readable bin label.
+    """
+    c = df[bin_col].astype("category")
+    categories = list(c.cat.categories)
+    if not categories:
+        return df.copy(), [], {}
+
+    if reference is None:
+        reference = categories[0]
+
+    dummies = pd.get_dummies(c, prefix="", prefix_sep="", drop_first=False, dtype=float)
+    if reference in dummies.columns:
+        dummies = dummies.drop(columns=[reference])
+
+    if dummies.empty:
+        return df.copy(), [], {}
+
+    df_out = pd.concat([df, dummies], axis=1)
+
+    rename_map: Dict[Any, str] = {}
+    label_map: Dict[str, str] = {}
+    dummy_names: List[str] = []
+    used_names: set[str] = set(str(col) for col in df.columns)
+
+    for col in dummies.columns:
+        label_str = str(col)
+        base = f"trbin_{_sanitize_bin_label(label_str)}"
+        name = base
+        counter = 1
+        while name in used_names:
+            counter += 1
+            name = f"{base}_{counter}"
+        rename_map[col] = name
+        label_map[name] = label_str
+        dummy_names.append(name)
+        used_names.add(name)
+
+    if rename_map:
+        df_out = df_out.rename(columns=rename_map)
+
+    return df_out, dummy_names, label_map
+
+
+def _build_bin_dummies(
+    df: pd.DataFrame,
+    bin_col: str,
+    untreated_label: str = "untreated",
+) -> Tuple[pd.DataFrame, List[str], Dict[str, str]]:
+    """
+    Convenience wrapper that:
+      1. Treats `untreated_label` as the reference bin.
+      2. Adds dummy columns trbin_<label> for all other bins.
+    """
+    c = df[bin_col].astype("category")
+    if len(c.cat.categories) == 0:
+        return df.copy(), [], {}
+
+    if untreated_label in c.cat.categories:
+        ref = untreated_label
+    else:
+        ref = c.cat.categories[0]
+    return _bin_categorical(df, bin_col=bin_col, reference=ref)
+
+
+def _cluster_terms_from_args(
+    df: pd.DataFrame,
+    config: StudyConfig,
+    wcb_args: Optional[Dict[str, Any]],
+) -> List[str]:
+    spec: Optional[Union[str, Sequence[str]]] = None
+    if wcb_args:
+        spec = (
+            wcb_args.get("cluster_spec")
+            or wcb_args.get("cluster_terms")
+            or wcb_args.get("cluster")
+        )
+    if spec is None:
+        spec = getattr(config, "cluster_col", None)
+    terms: List[str] = []
+    if isinstance(spec, str):
+        spec = [spec]
+    for term in spec or []:
+        if term in df.columns and term not in terms:
+            terms.append(term)
+    if not terms and hasattr(config, "unit_cols"):
+        for col in getattr(config, "unit_cols", ()):
+            if col in df.columns:
+                terms.append(col)
+                break
+    if not terms and "unit_id" in df.columns:
+        terms = ["unit_id"]
+    return terms
 
 
 def estimate_binned_att_o(
     panel: PanelData,
     config: StudyConfig,
+    fe_terms: Optional[Sequence[str]] = None,
+    *,
+    untreated_label: str = "untreated",
+    wcb_args: Optional[Dict[str, Any]] = None,
+    seed: Optional[int] = None,
 ) -> BinAttResult:
-    """Estimate bin-specific ATT^o via a collapsed two‑way FE regression.
+    """
+    Estimate bin-specific ATTs using a two-way FE regression with bin
+    dummies, optionally using the WildClusterBootstrap wrapper to obtain
+    p-values.
+
+    This is deliberately written to be robust and *not* to depend on
+    rpy2/Julia. The `WildClusterBootstrap` class in robustness.wcb uses
+    statsmodels with cluster-robust covariance internally.
 
     Parameters
     ----------
-    panel : PanelData
-        Prepared panel with outcome, dose_bin, covariates and FE identifiers.
-    config : StudyConfig
-        Includes FE flags, cluster id, bootstrap controls and seed.
+    panel :
+        Prepared PanelData output (contains df, covariates, outcome).
+    config :
+        Study configuration with defaults (e.g. unit/year columns).
+    fe_terms :
+        Optional override for fixed-effect columns.
+    untreated_label :
+        Label of the untreated bin (reference category).
+    wcb_args :
+        Optional WildClusterBootstrap configuration dict.
+    seed :
+        Optional seed forwarded to the bootstrap runner.
 
     Returns
     -------
     BinAttResult
-        - table: rows for each positive bin with coef, se, p, ci_low, ci_high, N, G
-        - model: fitted model object
-        - used: the DataFrame slice used in estimation (post dropna, etc.)
-        - name_map: mapping original bin label -> dummy column name
-
-    Notes
-    -----
-    * The baseline is taken to be the first category of `dose_bin` after coercion,
-      which we construct so that "untreated" is first when present.
-    * We construct dummy names in a sanitized, short form to prevent collinearity
-      and rpy2 conversion issues.
     """
     df = panel.panel.copy()
-    if df.empty:
-        raise ValueError("Panel is empty; cannot estimate binned ATT.")
-    
-    # Extract configuration values
-    outcome_col = panel.outcome_name
-    dose_bin_col = "dose_bin"
-    year_col = config.year_col
-    cluster_col = "unit_id"
-    controls = panel.info.get("covariates_used", []) or []
-    use_wcb = bool(getattr(config, "use_wcb", False))
-    wcb_B = int(getattr(config, "wcb_B", 9999))
-    wcb_weights = getattr(config, "wcb_weights", None)
-    impose_null = bool(getattr(config, "impose_null", True))
-    use_linearmodels = getattr(config, "use_linearmodels", None)
+    if df.empty or "dose_bin" not in df.columns:
+        empty = pd.Series([], dtype=float)
+        return BinAttResult(
+            bin_names=[],
+            coef=empty,
+            se=empty,
+            p_value=empty,
+            n_obs=int(df.shape[0]),
+            n_treated_bins=pd.Series([], dtype=float),
+            mde=None,
+            joint_test_pvalue=None,
+            p_value_wcb=None,
+            cluster_counts=None,
+        )
 
-    # Guardrails
-    needed = {outcome_col, dose_bin_col, year_col, cluster_col}
-    missing = needed.difference(df.columns)
-    if missing:
-        raise KeyError(f"Missing required columns: {sorted(missing)}")
+    outcome = panel.outcome_name or getattr(config, "outcome_col", "outcome")
+    bin_col = "dose_bin"
+    controls = list(panel.info.get("covariates_used", []) or [])
 
-    # Clean outcome & key columns
-    df = df.dropna(subset=[outcome_col, year_col, cluster_col]).copy()
+    cluster_terms = _cluster_terms_from_args(df, config, wcb_args)
+    cluster_col = cluster_terms[0] if cluster_terms else None
 
-    # Coerce bins to an ordered *string* categorical with 'untreated' first
-    cat = _as_ordered_categorical(df[dose_bin_col], untreated_label="untreated")
-    df["dose_bin_cat"] = cat
+    year_col = getattr(config, "year_col", "Year")
+    unit_for_fe: Optional[str] = cluster_col
+    if not unit_for_fe:
+        cfg_unit_cols = getattr(config, "unit_cols", None)
+        if cfg_unit_cols:
+            unit_for_fe = cfg_unit_cols[0]
+    if not unit_for_fe:
+        unit_for_fe = "unit_id"
 
-    # Build bin dummies (drop baseline) - pass the Series from dataframe to ensure index is available
-    Xb, bin_param_names, name_map = _build_bin_dummies(df["dose_bin_cat"], drop_first=True)
+    outcome_lower = str(outcome).lower()
+    include_unit_fe_default = not outcome_lower.startswith("d_")
+    default_fe: List[str] = [year_col]
+    if include_unit_fe_default:
+        if cluster_col:
+            default_fe.insert(0, cluster_col)
+        elif "unit_id" in df.columns:
+            default_fe.insert(0, "unit_id")
+    fe_terms = list(fe_terms) if fe_terms else default_fe
 
-    # Human-readable labels for the positive (non-baseline) bins in the same order as columns
-    inv_name_map = {v: k for k, v in name_map.items()}
-    pos_labels_hr = [inv_name_map[c] for c in list(Xb.columns)]
+    use_wcb = bool(wcb_args)
 
-    if len(bin_param_names) == 0 or Xb.shape[1] == 0:
-        # No positive bins in data
-        empty = pd.DataFrame(columns=[
-            "bin", "coef", "se", "p", "ci_low", "ci_high", "N", "G", "p_wcb"
-        ])
-        return BinAttResult(table=empty, model=None, used=df, name_map={})
+    # ------------------------------------------------------------------
+    # 1. Build bin dummies
+    # ------------------------------------------------------------------
+    df_work, bin_dummies, bin_label_map = _build_bin_dummies(
+        df.copy(), bin_col=bin_col, untreated_label=untreated_label
+    )
+    bin_labels = [bin_label_map.get(name, name) for name in bin_dummies]
 
-    # Assemble design matrix
-    y = df[outcome_col].astype(float)
+    # Safety: no bins -> nothing to do
+    if not bin_dummies:
+        empty = pd.Series([], dtype=float)
+        return BinAttResult(
+            bin_names=[],
+            coef=empty,
+            se=empty,
+            p_value=empty,
+            n_obs=int(df_work.shape[0]),
+            n_treated_bins=pd.Series([], dtype=float),
+            mde=None,
+            joint_test_pvalue=None,
+            p_value_wcb=None,
+            cluster_counts=None,
+        )
 
-    X_list = [Xb]
-    ctrl_cols: List[str] = []
-    if controls:
-        for c in controls:
-            if c in df.columns:
-                ctrl_cols.append(c)
-        if ctrl_cols:
-            X_list.append(df[ctrl_cols].astype(float))
+    # ------------------------------------------------------------------
+    # 2. OLS with fixed effects via statsmodels
+    # ------------------------------------------------------------------
+    rhs_terms: List[str] = []
+    rhs_terms.extend(bin_dummies)
+    rhs_terms.extend(controls)
 
-    X = pd.concat(X_list, axis=1)
+    # Fixed effects as categorical dummies
+    fe_terms = resolve_fe_terms(
+        fe_terms,
+        year_col=year_col,
+        unit_col=unit_for_fe,
+    )  # e.g. ["C(unit_id)", "C(Year)"]
+    rhs_terms.extend(fe_terms)
 
-    # Choose estimator
-    if use_linearmodels is None:
-        use_linearmodels = _HAVE_LM
+    formula = f"{outcome} ~ " + " + ".join(rhs_terms)
+    model = smf.ols(formula=formula, data=df_work)
+    ols_res = model.fit()
 
-    model = None
-    res = None
-
-    if use_linearmodels and _HAVE_LM:
-        # linearmodels PanelOLS with entity & time effects, clustered SEs
-        work = pd.concat([y, X, df[[cluster_col, year_col]]], axis=1)
-        work = work.dropna()
-        work = work.set_index([cluster_col, year_col])
-
-        exog = work[X.columns]
-        endog = work[outcome_col]
-
-        model = PanelOLS(endog, exog, entity_effects=True, time_effects=True)
-        # Provide clusters aligned with index
-        clusters = work.index.get_level_values(0)
-        res = model.fit(cov_type="clustered", clusters=clusters)
-
-        coefs = res.params.reindex(Xb.columns)
-        ses = res.std_errors.reindex(Xb.columns)
-        pvals = res.pvalues.reindex(Xb.columns)
+    # ------------------------------------------------------------------
+    # 3. Cluster-robust covariance
+    # ------------------------------------------------------------------
+    if cluster_col:
+        robust_res = ols_res.get_robustcov_results(
+            cov_type="cluster", groups=df_work[cluster_col]
+        )
     else:
-        # Fallback: statsmodels OLS with explicit C(FE); may be memory-heavy
-        work = pd.concat([y, X, df[[cluster_col, year_col]]], axis=1).dropna()
-        # Build formula: y ~ dummies + controls + C(unit) + C(year)
-        rhs_terms = list(X.columns)
-        rhs_terms.append(f"C({cluster_col})")
-        rhs_terms.append(f"C({year_col})")
-        formula = f"{outcome_col} ~ {' + '.join(rhs_terms)}"
-        model = smf.ols(formula=formula, data=work)
-        res = model.fit(cov_type="cluster", cov_kwds={"groups": work[cluster_col], "use_correction": True})
+        robust_res = ols_res
 
-        coefs = res.params.reindex(Xb.columns)
-        ses = res.bse.reindex(Xb.columns)
-        pvals = res.pvalues.reindex(Xb.columns)
+    params = _series_from_result(robust_res.params, robust_res.model, "param_").reindex(bin_dummies)
+    ses = _series_from_result(robust_res.bse, robust_res.model, "se_").reindex(bin_dummies)
 
-    # Confidence intervals (normal approx)
-    ci_low = coefs - 1.96 * ses
-    ci_high = coefs + 1.96 * ses
-
-    # Basic counts
-    G = int(df[cluster_col].nunique())
-    N = int(len(df))
-
-    # Compute per-bin MDE at default target power (analytic_mde_from_se defaults to 80% power)
-    mde_vals = [analytic_mde_from_se(float(s), int(G)) if pd.notna(s) else np.nan for s in ses.values]
-
-    out = pd.DataFrame({
-        "bin": pos_labels_hr,
-        "coef": list(coefs.values),
-        "se": list(ses.values),
-        "p": list(pvals.values),
-        "lo": list(ci_low.values),  # renamed to match summary.py expectations
-        "hi": list(ci_high.values),  # renamed to match summary.py expectations
-        "n_obs": N,  # renamed to match summary.py expectations
-        "clusters": G,  # renamed to match summary.py expectations
-        "mde": mde_vals,
-        "term": list(coefs.index),
-    })
-
-    # Indicate detectability at target power: abs(effect) >= MDE
+    # ------------------------------------------------------------------
+    # 4. p-values via WildClusterBootstrap wrapper (or analytic)
+    # ------------------------------------------------------------------
     try:
-        out["below_target_power"] = (out["coef"].abs() < out["mde"]).astype(bool)
+        ttest = robust_res.t_test(bin_dummies)
+        analytic_vals = np.asarray(np.atleast_1d(ttest.pvalue)).reshape(-1)
+        analytic_pvals = pd.Series(analytic_vals, index=bin_dummies, dtype=float)
     except Exception:
-        out["below_target_power"] = np.nan
+        analytic_pvals = pd.Series([float("nan")] * len(bin_dummies), index=bin_dummies, dtype=float)
 
-    # Attach optional WCB p-values
-    out["p_wcb"] = np.nan
-    if use_wcb and _HAVE_WCB:
+    wcb_runner: Optional[WildClusterBootstrap] = None
+    pvals_wcb: Optional[pd.Series] = None
+    if wcb_args:
+        fit_spec = FitSpec(
+            outcome=outcome,
+            regressors=list(bin_dummies) + list(controls),
+            fe=list(fe_terms),
+            cluster=list(cluster_terms),
+        )
+        wcb_runner = WildClusterBootstrap(
+            df=df_work,
+            fit_spec=fit_spec,
+            B=wcb_args['B'],
+            weights=wcb_args['weights'],
+            seed=seed,
+            impose_null=wcb_args['impose_null'],
+        )
+
+        wcb_values: List[float] = []
+        for param in bin_dummies:
+            pval = wcb_runner.pvalue(TestSpec(param=param))
+            wcb_values.append(pval)
+        pvals_wcb = pd.Series(wcb_values, index=bin_dummies, dtype=float)
+
+    # ------------------------------------------------------------------
+    # 5. MDEs (analytic, using cluster-robust SEs)
+    # ------------------------------------------------------------------
+    n_clusters_mde: Optional[int] = None
+    if cluster_col and cluster_col in df_work.columns:
+        n_clusters_mde = int(df_work[cluster_col].nunique())
+    elif "unit_id" in df_work.columns:
+        n_clusters_mde = int(df_work["unit_id"].nunique())
+
+    if n_clusters_mde and n_clusters_mde > 0:
+        mde = ses.apply(
+            lambda x: analytic_mde_from_se(float(x), n_clusters_mde)
+            if pd.notna(x)
+            else np.nan
+        )
+    else:
+        mde = None
+
+    # ------------------------------------------------------------------
+    # 6. Optional joint test across *all* treated bins
+    # ------------------------------------------------------------------
+    joint_pvalue: Optional[float] = None
+    try:
+        if use_wcb and len(bin_dummies) > 1 and wcb_runner is not None:
+            joint_pvalue = wcb_runner.pvalue(TestSpec(joint_zero=list(bin_dummies)))
+    except Exception:
+        # Fallback: analytic Wald test with cluster-robust cov
         try:
-            # Use wcb_att_pvalue_r for each bin coefficient separately
-            # Build the data with bin dummies
-            wcb_data = pd.concat([df[[outcome_col, cluster_col, year_col]], X], axis=1).dropna()
-            base_terms = list(Xb.columns)
-            if ctrl_cols:
-                base_terms += ctrl_cols
-            
-            # Compute WCB p-value for each bin coefficient
-            from ..helpers.utils import choose_wcb_weights_and_B
-            
-            wt, BB = choose_wcb_weights_and_B(G, wcb_weights, wcb_B)
-            wcb_p_dict = {}
-            for term_name in Xb.columns:
-                try:
-                    p_wcb_val = wcb_att_pvalue_r(
-                        wcb_data,
-                        outcome=outcome_col,
-                        regressors=base_terms,
-                        fe=[year_col, cluster_col],
-                        cluster=cluster_col,
-                        param=term_name,
-                        B=int(BB),
-                        weights=wt,
-                        seed=int(getattr(config, "seed", 123) or 123),
-                        impose_null=impose_null,
-                    )
-                    wcb_p_dict[term_name] = p_wcb_val
-                except Exception:
-                    wcb_p_dict[term_name] = np.nan
-            
-            # Map WCB p-values using term column (before dropping it)
-            out["p_wcb"] = out["term"].map(wcb_p_dict)
-        except Exception:  # pragma: no cover - keep robust
-            # If WCB fails, we just leave p_wcb as NaN
-            pass
+            constraints = " = 0, ".join(bin_dummies) + " = 0"
+            wald_res = robust_res.wald_test(constraints)
+            joint_pvalue = float(wald_res.pvalue)
+        except Exception:
+            joint_pvalue = None
 
-    # Add coef_name column for downstream use (e.g., WCB in study.py)
-    # Map bin labels to their parameter names using name_map
-    out["coef_name"] = out["bin"].map(name_map)
-    
-    # Final tidy table (drop internal term names, but keep coef_name for WCB)
-    out = out.drop(columns=["term"])  # keep only human-readable bin labels
+    # Count treated observations per bin
+    n_treated_bins = df_work.groupby(bin_col)[outcome].count()
+    n_treated_bins = n_treated_bins.reindex(bin_labels)
+    cluster_counts: Optional[pd.Series] = None
+    if cluster_col and cluster_col in df_work.columns:
+        cluster_counts = df_work.groupby(bin_col)[cluster_col].nunique().reindex(bin_labels)
 
-    # Order by the original categorical order of pos_labels (human-readable)
-    order_map = {lab: i for i, lab in enumerate(pos_labels_hr)}
-    out["_ord"] = out["bin"].map(order_map)
-    out = out.sort_values("_ord").drop(columns=["_ord"]).reset_index(drop=True)
-
-    # Return dataclass
-    # Build used dataframe with bin dummies for WCB
-    used_cols = [outcome_col, dose_bin_col, "dose_bin_cat", year_col, cluster_col]
-    if ctrl_cols:
-        used_cols += ctrl_cols
-    # Start with base columns from df
-    used = df[[c for c in used_cols if c in df.columns]].copy()
-    # Add bin dummy columns (Xb is aligned with df by index)
-    for col in Xb.columns:
-        used[col] = Xb[col]
-
-    return BinAttResult(table=out, model=res, used=used, name_map=name_map)
-
-
-# ---------------------------------------------------------------------------
-# Pretty printing
-# ---------------------------------------------------------------------------
-
-def format_binned_att_table(tbl: pd.DataFrame, digits: int = 3, include_wcb: bool = True) -> pd.DataFrame:
-    """Return a copy with rounded numbers and compact CI strings for display."""
-    t = tbl.copy()
-    for c in ["coef", "se", "p", "ci_low", "ci_high", "p_wcb"]:
-        if c in t:
-            t[c] = pd.to_numeric(t[c], errors="coerce")
-    t["coef"] = t["coef"].round(digits)
-    t["se"] = t["se"].round(digits)
-    t["p"] = t["p"].round(3)
-    if "p_wcb" in t and include_wcb:
-        t["p_wcb"] = t["p_wcb"].round(3)
-    if "ci_low" in t and "ci_high" in t:
-        t["CI (95%)"] = t.apply(lambda r: f"[{r['ci_low']:.{digits}f}, {r['ci_high']:.{digits}f}]" if pd.notna(r['ci_low']) else "", axis=1)
-        t = t.drop(columns=["ci_low", "ci_high"], errors="ignore")
-    # Reorder
-    cols = ["bin", "coef", "se", "p"]
-    if "p_wcb" in t and include_wcb:
-        cols += ["p_wcb"]
-    cols += ["CI (95%)", "N", "G"]
-    cols = [c for c in cols if c in t.columns]
-    t = t[cols]
-    return t
-
-
-def _ensure_series(x: Iterable | pd.Series | pd.DataFrame) -> pd.Series:
-    """Coerce a 1-D input (Series / single-col DataFrame / array / list) to Series."""
-    if isinstance(x, pd.DataFrame):
-        if x.shape[1] != 1:
-            raise ValueError("Expected a single-column DataFrame for binning.")
-        return x.iloc[:, 0]
-    if isinstance(x, pd.Series):
-        return x
-    return pd.Series(x)
-
-
-def _bin_categorical(
-    series: pd.Series | pd.DataFrame | Iterable,
-    *,
-    untreated_label: str = "untreated",
-    order: Optional[List[str]] = None,
-) -> pd.Categorical:
-    """
-    Convert a 'dose_bin'-like input into an **ordered** string categorical.
-    Accepts Series, single-col DataFrame, numpy array, or list.
-    NA -> untreated_label. Works for Interval dtype (stringifies cleanly).
-    """
-    s = _ensure_series(series)
-    obj = s.astype(object).where(s.notna(), other=untreated_label)
-    values = obj.astype(str)  # Intervals stringify fine here
-
-    cats_obs = pd.Index(pd.unique(values))
-
-    if order:
-        ordered = [c for c in order if c in set(cats_obs)]
-        cats = pd.Index(ordered) if ordered else cats_obs
-    else:
-        cats = cats_obs
-
-    return pd.Categorical(values, categories=cats, ordered=True)
-
-
-def _build_bin_dummies(
-    cat: pd.Categorical,
-    *,
-    drop_first: bool = True,
-    prefix: str = "trbin",
-) -> Tuple[pd.DataFrame, List[str], Dict[str, str]]:
-    """
-    Build numeric dummies for each category; drop the first as baseline.
-
-    Returns
-    -------
-    Xb : pd.DataFrame
-        DataFrame of dummy regressors with sanitized column names safe for Patsy.
-    bin_param_names : List[str]
-        The ordered list of parameter names corresponding to positive (non-baseline) bins.
-    name_map : Dict[str, str]
-        Mapping from the original human-readable bin label -> sanitized column name.
-    """
-    if not isinstance(cat, pd.Categorical):
-        cat = pd.Categorical(_ensure_series(cat).astype(str), ordered=True)
-
-    labels = list(cat.categories)
-    if not labels:
-        n = len(pd.Series(cat))
-        return pd.DataFrame(index=pd.RangeIndex(n)), [], {}
-
-    s = pd.Series(cat).astype(str)
-    data: Dict[str, Any] = {}
-    all_cols: List[str] = []
-    name_map: Dict[str, str] = {}
-
-    for lab in labels:
-        lab_str = str(lab)
-        safe = f"{prefix}_{_sanitize_bin_label(lab_str)}"
-        name_map[lab_str] = safe
-        data[safe] = (s == lab_str).astype(float)
-        all_cols.append(safe)
-
-    X = pd.DataFrame(data, index=s.index)
-
-    # Drop baseline column if requested (first category by construction)
-    bin_param_names: List[str]
-    if drop_first and len(labels) > 0:
-        ref_label = str(labels[0])
-        ref_col = name_map[ref_label]
-        X = X.drop(columns=[ref_col])
-        bin_param_names = [c for c in all_cols if c != ref_col]
-    else:
-        bin_param_names = list(all_cols)
-
-    return X, bin_param_names, name_map
+    return BinAttResult(
+        bin_names=bin_labels,
+        coef=params,
+        se=ses,
+        p_value=analytic_pvals,
+        n_obs=int(df_work.shape[0]),
+        n_treated_bins=n_treated_bins,
+        mde=mde,
+        joint_test_pvalue=joint_pvalue,
+        p_value_wcb=pvals_wcb,
+        cluster_counts=cluster_counts,
+    )

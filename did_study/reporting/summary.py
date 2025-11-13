@@ -1,7 +1,7 @@
-# summary.py
+﻿# summary.py
 from __future__ import annotations
 
-from dataclasses import dataclass, is_dataclass
+from dataclasses import dataclass
 from typing import Dict, Optional, Any
 
 import numpy as np
@@ -14,7 +14,7 @@ from .plotting import (
     plot_att_pooled_point,
     plot_att_combined,
     plot_event_study_line,
-    plot_honestdid_mcurve,
+    plot_honest_did_M_curve,
     plot_support_by_tau,
     plot_mean_dose_by_tau,
     plot_att_combo,
@@ -89,6 +89,69 @@ def _rule(title: str | None = None) -> None:
     else:
         print(f"\n{line}")
 
+
+def _series_value_at(series: Any, idx: int) -> float:
+    if series is None:
+        return float("nan")
+    try:
+        if hasattr(series, "iloc"):
+            return float(series.iloc[idx])
+        return float(series[idx])
+    except Exception:
+        try:
+            return float(list(series)[idx])
+        except Exception:
+            return float("nan")
+
+
+def _bins_result_to_df(bin_result: Any) -> pd.DataFrame:
+    if bin_result is None:
+        return pd.DataFrame()
+    names = list(getattr(bin_result, "bin_names", []) or [])
+    if not names:
+        return pd.DataFrame()
+
+    coef_series = getattr(bin_result, "coef", None)
+    se_series = getattr(bin_result, "se", None)
+    p_series = getattr(bin_result, "p_value", None)
+    p_wcb_series = getattr(bin_result, "p_value_wcb", None)
+    n_treated = getattr(bin_result, "n_treated_bins", None)
+    cluster_series = getattr(bin_result, "cluster_counts", None)
+    mde_series = getattr(bin_result, "mde", None)
+
+    rows = []
+    for idx, name in enumerate(names):
+        coef = _series_value_at(coef_series, idx)
+        se = _series_value_at(se_series, idx)
+        p = _series_value_at(p_series, idx)
+        mde = _series_value_at(mde_series, idx)
+        lo = coef - 1.96 * se if np.isfinite(se) else float("nan")
+        hi = coef + 1.96 * se if np.isfinite(se) else float("nan")
+        n_obs = None
+        if isinstance(n_treated, pd.Series):
+            n_obs = float(n_treated.get(name, np.nan))
+        clusters = None
+        if isinstance(cluster_series, pd.Series):
+            clusters = float(cluster_series.get(name, np.nan))
+        p_wcb = _series_value_at(p_wcb_series, idx) if p_wcb_series is not None else float("nan")
+
+        rows.append(
+            {
+                "bin": name,
+                "coef": coef,
+                "se": se,
+                "p": p,
+                "p_wcb": p_wcb,
+                "clusters": clusters,
+                "n_obs": n_obs,
+                "MDE_analytic": mde,
+                "lo": lo,
+                "hi": hi,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
 # ================================
 # Main printable carrier
 # ================================
@@ -104,6 +167,7 @@ class StudyPrintable:
       att_bins: DataFrame with ['bin','coef','p','p_wcb','clusters','n_obs','MDE_analytic','lo','hi']
       es_pooled: DataFrame with ['event_time','beta','se'] or ['event_time','beta','lo','hi']
       pta_pooled_p: float
+      es_wcb_p: Optional[float]  # joint WCB test across ES coefficients
       honestdid: dict with 'M','lo','hi','theta_hat' (optional)
       support_by_tau: DataFrame with ['event_time','units'] (optional)
 
@@ -121,7 +185,8 @@ class StudyPrintable:
     att_bins: pd.DataFrame
     es_pooled: pd.DataFrame
     pta_pooled_p: Optional[float]
-    honestdid: Optional[Dict[str, Any]] = None
+    es_wcb_p: Optional[float] = None
+    honest_did: Optional[Dict[str, Any]] = None
     support_by_tau: Optional[pd.DataFrame] = None
 
     # WCB omnibus tests only
@@ -158,11 +223,7 @@ def print_panel_block(info: Dict[str, Any]) -> None:
     if dose_series is not None:
         plot_dose_distribution(
             dose_series,
-            title="Dose distribution",
-            xlabel="Dose level",
-            ylabel="Density",
-            density=False,
-            save=info.get("dose_plot_path"),
+            density=False
         )
 
 def print_att_pooled_block(att: Dict[str, Any], att_bins: Optional[pd.DataFrame] = None) -> None:
@@ -186,9 +247,9 @@ def print_att_pooled_block(att: Dict[str, Any], att_bins: Optional[pd.DataFrame]
         wcb_info = att.get("wcb_info", {})
         wtype = wcb_info.get("weights", "auto")
         B = wcb_info.get("B", "NA")
-        print(f"WCB p = {_fmt_p(p_wcb)} — (fwildclusterboot::boottest, two-sided; weights={wtype}, B={B})")
+        print(f"WCB p = {_fmt_p(p_wcb)} - (fwildclusterboot::boottest, two-sided; weights={wtype}, B={B})")
     if mde is not None:
-        print(f"MDE (α=0.05, 80% power): {mde:.4f} (Δlog scale ≈ percentage points; 0.01 ≈ 1 p.p.)")
+        print(f"MDE (alpha=0.05, 80% power): {mde:.4f} (Deltalog scale ~ percentage points; 0.01 ~ 1 p.p.)")
 
     # Plot combined: pooled + binned if available
     if att_bins is not None and len(att_bins) > 0:
@@ -196,10 +257,10 @@ def print_att_pooled_block(att: Dict[str, Any], att_bins: Optional[pd.DataFrame]
             coef=coef, lo=lo, hi=hi,
             bins_df=att_bins,
             title="ATT$^{o}$ (pooled + by bin)",
-            ylabel="Effect (Δlog units)"
+            ylabel="Effect (Deltalog units)"
         )
     else:
-        plot_att_pooled_point(coef=coef, lo=lo, hi=hi, title="ATT$^{o}$ (pooled)", ylabel="Effect (Δlog units)")
+        plot_att_pooled_point(coef=coef, lo=lo, hi=hi, title="ATT$^{o}$ (pooled)", ylabel="Effect (Deltalog units)")
 
 def print_att_bins_block(
     tbl: pd.DataFrame,
@@ -226,7 +287,7 @@ def print_att_bins_block(
         B = (wcb_info or {}).get("B", "NA")
         cl = (wcb_info or {}).get("cluster", "cluster")
         print(
-            f"\n[WCB omnibus — H0: all bin effects = 0] "
+            f"\n[WCB omnibus - H0: all bin effects = 0] "
             f"p = {_fmt_p(wcb_allzero_p)} "
             f"(fwildclusterboot::mboottest, two-sided; cluster={cl}; weights={w}, B={B})"
         )
@@ -235,7 +296,7 @@ def print_att_bins_block(
         B = (wcb_info or {}).get("B", "NA")
         cl = (wcb_info or {}).get("cluster", "cluster")
         print(
-            f"[WCB heterogeneity — H0: all bin effects equal] "
+            f"[WCB heterogeneity - H0: all bin effects equal] "
             f"p = {_fmt_p(wcb_equal_p)} "
             f"(fwildclusterboot::mboottest, two-sided; cluster={cl}; weights={w}, B={B})"
         )
@@ -260,7 +321,7 @@ def print_es_block(
 
     if pta_p is not None:
         verdict = "reject" if (pta_p is not None and pta_p < 0.05) else "fail to reject"
-        print(f"PTA (leads joint = 0) p = {_fmt_p(pta_p)} — Pre-trend: {verdict} H0 at 5%.")
+        print(f"PTA (leads joint = 0) p = {_fmt_p(pta_p)} - Pre-trend: {verdict} H0 at 5%.")
 
     # Restrict plotting to the configured pre/post window if provided
     df_plot = df_es.copy()
@@ -273,15 +334,15 @@ def print_es_block(
             pass
 
     try:
-        plot_event_study_line(df_plot, title="Event study (pooled)", xlabel="Event time τ", ylabel="Effect (Δlog units)")
+        plot_event_study_line(df_plot, title="Event study (pooled)", xlabel="Event time tau", ylabel="Effect (Deltalog units)")
     except Exception as e:
         print(f"[plot warning] could not plot ES: {e}")
 
     if support_by_tau is not None and len(support_by_tau) > 0:
         try:
-            plot_support_by_tau(support_by_tau, title="Pre-trend support (units by lead τ)", xlabel="Event time τ (leads)", ylabel="Units")
+            plot_support_by_tau(support_by_tau, title="Pre-trend support (units by lead tau)", xlabel="Event time tau (leads)", ylabel="Units")
         except Exception as e:
-            print(f"[plot warning] could not plot support-by-τ: {e}")
+            print(f"[plot warning] could not plot support-by-tau: {e}")
 
     # Plot mean dose by event time
     if panel_df is not None and "dose_level" in panel_df.columns and "event_time" in panel_df.columns:
@@ -289,11 +350,11 @@ def print_es_block(
             plot_mean_dose_by_tau(
                 panel_df,
                 title="Mean dose by event time",
-                xlabel="Event time τ",
+                xlabel="Event time tau",
                 ylabel="Mean dose",
             )
         except Exception as e:
-            print(f"[plot warning] could not plot mean dose by τ: {e}")
+            print(f"[plot warning] could not plot mean dose by tau: {e}")
 
 def print_honestdid_block(hd: Optional[Dict[str, Any]]) -> None:
     _rule("HonestDiD")
@@ -310,7 +371,7 @@ def print_honestdid_block(hd: Optional[Dict[str, Any]]) -> None:
     if k > 0:
         print("[first rows]")
         for i in range(k):
-            th_txt = f"(naive θ̂={theta_hat:+.3f})" if theta_hat is not None else ""
+            th_txt = f"(naive theta_hat={theta_hat:+.3f})" if theta_hat is not None else ""
             print(f" M={M[i]:.2f}: [{lo[i]:+.3f}, {hi[i]:+.3f}] {th_txt}")
 
     include_zero = (lo <= 0) & (0 <= hi)
@@ -323,7 +384,7 @@ def print_honestdid_block(hd: Optional[Dict[str, Any]]) -> None:
         print(" Summary: bounds include 0 across M-grid (no robust sign).")
 
     try:
-        plot_honestdid_mcurve(M, lo, hi, theta_hat=theta_hat, title="HonestDiD M-sensitivity", xlabel="M", ylabel="Bounded effect interval")
+        plot_honest_did_M_curve(M, lo, hi, theta_hat=theta_hat, title="HonestDiD M-sensitivity", xlabel="M", ylabel="Bounded effect interval")
     except Exception as e:
         print(f"[plot warning] could not plot HonestDiD M-curve: {e}")
 
@@ -333,7 +394,8 @@ def print_overall_support(
     att_bins: Optional[pd.DataFrame] = None,
     wcb_allzero_p: Optional[float] = None,
     hd: Optional[Dict[str, Any]] = None,
-    wcb_bins_info: Optional[Dict[str, Any]] = None
+    wcb_bins_info: Optional[Dict[str, Any]] = None,
+    es_wcb_p: Optional[float] = None,
 ) -> None:
     _rule("Overall Support")
 
@@ -341,9 +403,14 @@ def print_overall_support(
     if pta_p is not None:
         pta_pass = pta_p >= 0.05
         pta_stars = _fmt_p_with_stars(pta_p)
-        print(f"PTA (pre-trends): p = {pta_stars} → {'PASS' if pta_pass else 'FAIL'} (fail-to-reject is PASS).")
+        print(f"PTA (pre-trends): p = {pta_stars} -> {'PASS' if pta_pass else 'FAIL'} (fail-to-reject is PASS).")
     else:
         print("PTA (pre-trends): NA")
+
+    if es_wcb_p is not None:
+        print(f"Event-study joint WCB test (all coefficients): p = {_fmt_p_with_stars(es_wcb_p)}")
+    else:
+        print("Event-study joint WCB test: NA")
 
     # 2) Main pooled estimate
     coef = att.get("coef", np.nan)
@@ -375,8 +442,8 @@ def print_overall_support(
         ap = _actual_power_from_effect(coef, se, ncl, alpha=0.05, two_sided=True)
         if ap is not None and np.isfinite(ap):
             print(f"  Actual power @ |estimate|: {_percent(ap, digits=1)}")
-        print(f"  MDE (α=0.05, 80% power): {mde:.4f}")
-        print(f"  |estimate| > MDE: {'Yes' if larger_than_mde else 'No'} → {'Robust effect supported' if robust_supported else 'Effect may not be robust'}")
+        print(f"  MDE (alpha=0.05, 80% power): {mde:.4f}")
+        print(f"  |estimate| > MDE: {'Yes' if larger_than_mde else 'No'} -> {'Robust effect supported' if robust_supported else 'Effect may not be robust'}")
     elif mde is not None:
         print(f"  MDE: {mde:.4f}")
 
@@ -399,7 +466,7 @@ def print_overall_support(
         cl = (wcb_bins_info or {}).get("cluster", "cluster")
         wcb_joint_stars = _fmt_p_with_stars(wcb_allzero_p)
         print(
-            f"\nWCB omnibus over bins — H0: all positive-dose bin effects = 0 "
+            f"\nWCB omnibus over bins - H0: all positive-dose bin effects = 0 "
             f"(fwildclusterboot::mboottest, two-sided; cluster={cl}; weights={w}, B={B}): "
             f"p = {wcb_joint_stars}"
         )
@@ -416,11 +483,11 @@ def print_overall_support(
             indices = np.where(~include_zero)[0]
             if len(indices) > 0:
                 i0, i1 = indices.min(), indices.max()
-                print(f"\nHonestDiD: bounds exclude 0 for M in [{M[i0]:.2f}, {M[i1]:.2f}] → robust effect supported.")
+                print(f"\nHonestDiD: bounds exclude 0 for M in [{M[i0]:.2f}, {M[i1]:.2f}] -> robust effect supported.")
             else:
-                print(f"\nHonestDiD: bounds include 0 across M-grid → no robust sign.")
+                print(f"\nHonestDiD: bounds include 0 across M-grid -> no robust sign.")
         else:
-            print(f"\nHonestDiD: bounds include 0 across M-grid → no robust sign.")
+            print(f"\nHonestDiD: bounds include 0 across M-grid -> no robust sign.")
 
 # ================================
 # New: unified ATT summary table (pooled + per-bin)
@@ -495,41 +562,108 @@ def _as_dict(obj: Any) -> Dict[str, Any]:
         return {}
     if isinstance(obj, dict):
         return dict(obj)
-    if is_dataclass(obj):
-        try:
-            from dataclasses import asdict
-            return asdict(obj)
-        except Exception:
-            pass
     out = {}
     for k in ["coef","se","p","p_wcb","lo","hi","mde","n_clusters","n_obs","clusters","n"]:
         if hasattr(obj, k):
             out[k] = getattr(obj, k)
+    used = getattr(obj, "used", None)
+    if isinstance(used, pd.DataFrame):
+        out.setdefault("n_obs", len(used))
+        if "unit_id" in used.columns:
+            clusters = used["unit_id"].nunique()
+            out.setdefault("n_clusters", clusters)
+            out.setdefault("clusters", clusters)
     return out
 
 def study_printable_from_didstudy(results: Dict[str, Any]) -> StudyPrintable:
-    panel_info = results.get("panel_info", {}) or {}
+    def _res_get(obj: Any, name: str, default: Any = None) -> Any:
+        if isinstance(obj, dict):
+            return obj.get(name, default)
+        return getattr(obj, name, default)
 
-    # 1) Pooled ATT
-    att_obj = results.get("att") or results.get("att_pooled")
+    def _res_pick(obj: Any, *names: str, default: Any = None) -> Any:
+        for name in names:
+            if not name:
+                continue
+            val = _res_get(obj, name, None)
+            if val is not None:
+                return val
+        return default
+
+    data_obj = _res_pick(results, "data")
+    panel_info = _res_pick(results, "panel_info") or {}
+    if not panel_info and data_obj is not None:
+        panel_info = getattr(data_obj, "info", {}) or {}
+    if not isinstance(panel_info, dict):
+        panel_info = dict(panel_info)
+
+    panel_df = _res_pick(results, "panel")
+    if not isinstance(panel_df, pd.DataFrame) and data_obj is not None:
+        panel_df = getattr(data_obj, "panel", None)
+    if not isinstance(panel_df, pd.DataFrame):
+        panel_df = None
+
+    # --- Fallbacks so PANEL STATS always prints real numbers ---
+    if panel_df is not None:
+        panel_info.setdefault("units", int(panel_df["unit_id"].nunique()) if "unit_id" in panel_df.columns else None)
+        if "treated_ever" in panel_df.columns:
+            try:
+                ever = int(panel_df.groupby("unit_id")["treated_ever"].max().sum())
+            except Exception:
+                ever = int(panel_df["treated_ever"].max()) if "treated_ever" in panel_df.columns else None
+            panel_info.setdefault("ever_treated", ever)
+        panel_info.setdefault("obs", int(len(panel_df)))
+        if "post" in panel_df.columns:
+            panel_info.setdefault("post_rows", int((panel_df["post"] == 1).sum()))
+
+        if "dose_bin_counts" not in panel_info and {"dose_bin", "unit_id", "post"} <= set(panel_df.columns):
+            post = panel_df.loc[panel_df["post"] == 1].copy()
+            if not post.empty:
+                counts = {}
+                for b, g in post.groupby("dose_bin", dropna=True):
+                    counts[str(b)] = {"units": int(g["unit_id"].nunique()), "rows": int(len(g))}
+                if counts:
+                    panel_info["dose_bin_counts"] = counts
+
+        if "dose_series" not in panel_info and "dose_level" in panel_df.columns:
+            panel_info["dose_series"] = panel_df["dose_level"].astype(float).dropna()
+
+    att_obj = _res_pick(results, "att", "att_pooled")
     att_d = _as_dict(att_obj)
 
-    # Extract WCB info for pooled ATT (weights/B) if available
-    wcb_info = results.get("wcb_info", {})
-    config = results.get("config")
-    if hasattr(att_obj, "p_wcb") and getattr(att_obj, "p_wcb") is not None:
-        if config:
-            wcb_info = {
-                "weights": getattr(config, "wcb_weights", "auto"),
-                "B": getattr(config, "wcb_B", 9999),
-            }
+    wcb_info = _res_pick(results, "wcb_info")
+    if wcb_info is None:
+        wcb_meta = _res_pick(results, "wcb_meta")
+        wcb_info = wcb_meta if isinstance(wcb_meta, dict) else {}
+    config = _res_pick(results, "config")
+    if hasattr(att_obj, "p_wcb") and getattr(att_obj, "p_wcb") is not None and config:
+        wcb_info = {
+            "weights": getattr(config, "wcb_weights", "auto"),
+            "B": getattr(config, "wcb_B", 9999),
+        }
+
+    coef = float(att_d.get("coef", np.nan))
+    se_raw = att_d.get("se", np.nan)
+    se = float(se_raw) if se_raw is not None else np.nan
+
+    def _filled_ci(side_val: Any, fallback: float) -> float:
+        try:
+            val = float(side_val)
+        except (TypeError, ValueError):
+            val = np.nan
+        if np.isnan(val) and np.isfinite(fallback):
+            return fallback
+        return val
+
+    lo = _filled_ci(att_d.get("lo", np.nan), coef - 1.96 * se if np.isfinite(se) else np.nan)
+    hi = _filled_ci(att_d.get("hi", np.nan), coef + 1.96 * se if np.isfinite(se) else np.nan)
 
     att_pooled = {
-        "coef": float(att_d.get("coef", np.nan)),
-        "se": float(att_d.get("se", np.nan)),
+        "coef": coef,
+        "se": se,
         "p": float(att_d.get("p", np.nan)),
-        "lo": float(att_d.get("lo", np.nan)),
-        "hi": float(att_d.get("hi", np.nan)),
+        "lo": lo,
+        "hi": hi,
         "p_wcb": None if (att_d.get("p_wcb") is None or (isinstance(att_d.get("p_wcb"), float) and np.isnan(att_d.get("p_wcb")))) else float(att_d.get("p_wcb")),
         "clusters": int(att_d.get("n_clusters", att_d.get("clusters", np.nan))) if att_d.get("n_clusters", None) is not None or att_d.get("clusters", None) is not None else None,
         "n": int(att_d.get("n_obs", att_d.get("n", np.nan))) if att_d.get("n_obs", None) is not None or att_d.get("n", None) is not None else None,
@@ -537,22 +671,21 @@ def study_printable_from_didstudy(results: Dict[str, Any]) -> StudyPrintable:
         "wcb_info": wcb_info,
     }
 
-    # 2) ATT by bins
-    att_bins = results.get("att_bins")
+    att_bins = _res_pick(results, "att_bins", "bins")
     if isinstance(att_bins, pd.DataFrame):
         bins_df = att_bins.copy()
-        ren = {}
-        if "bin_label" in bins_df.columns and "bin" not in bins_df.columns:
-            ren["bin_label"] = "bin"
-        if "SE" in bins_df.columns and "se" not in bins_df.columns:
-            ren["SE"] = "se"
-        if ren:
-            bins_df = bins_df.rename(columns=ren)
     else:
-        bins_df = pd.DataFrame()
+        bins_df = _bins_result_to_df(att_bins)
+    ren = {}
+    if "bin_label" in bins_df.columns and "bin" not in bins_df.columns:
+        ren["bin_label"] = "bin"
+    if "SE" in bins_df.columns and "se" not in bins_df.columns:
+        ren["SE"] = "se"
+    if ren:
+        bins_df = bins_df.rename(columns=ren)
 
-    # 3) ES
-    es_obj = results.get("event_study") or results.get("es_pooled")
+    es_wcb = _res_pick(results, "es_wcb_p")
+    es_obj = _res_pick(results, "event_study", "es_pooled")
     if es_obj is None:
         es_df = pd.DataFrame()
         pta_p = None
@@ -561,10 +694,12 @@ def study_printable_from_didstudy(results: Dict[str, Any]) -> StudyPrintable:
             es_df = getattr(es_obj, "coefs")
             pta_p_raw = getattr(es_obj, "pta_p", np.nan)
             pta_p = None if (isinstance(pta_p_raw, float) and np.isnan(pta_p_raw)) else pta_p_raw
+            es_wcb = getattr(es_obj, "wcb_p", None)
         elif isinstance(es_obj, dict):
             es_df = es_obj.get("coefs", pd.DataFrame())
             pta_p_raw = es_obj.get("pta_p", np.nan)
             pta_p = None if (isinstance(pta_p_raw, float) and np.isnan(pta_p_raw)) else pta_p_raw
+            es_wcb = es_obj.get("wcb_p")
         else:
             es_df = pd.DataFrame()
             pta_p = None
@@ -572,33 +707,21 @@ def study_printable_from_didstudy(results: Dict[str, Any]) -> StudyPrintable:
             if "se" in es_df.columns:
                 se = es_df["se"].astype(float)
                 es_df = es_df.assign(lo=es_df["beta"].astype(float) - 1.96 * se, hi=es_df["beta"].astype(float) + 1.96 * se)
+        if isinstance(es_wcb, float) and np.isnan(es_wcb):
+            es_wcb = None
 
-    # 4) HonestDiD
-    hd = results.get("honestdid_pooled") or results.get("honestdid")
-    honest = None
-    if hd is not None:
-        rdf = hd.get("results_df")
-        if isinstance(rdf, pd.DataFrame) and "M" in rdf.columns and "lower" in rdf.columns and "upper" in rdf.columns:
-            honest = {
-                "M": rdf["M"].astype(float).tolist(),
-                "lo": rdf["lower"].astype(float).tolist(),
-                "hi": rdf["upper"].astype(float).tolist(),
-                "theta_hat": float(hd.get("theta_hat", np.nan)),
-            }
+    honest = getattr(results, "honest_did", None)
 
-    # 5) Support-by-τ if present
-    support_df = results.get("support_by_tau")
+    support_df = _res_pick(results, "support_by_tau")
     if not isinstance(support_df, pd.DataFrame):
         support_df = None
 
-    # WCB omnibus tests & display info (bins)
-    tests = results.get("att_bins_tests") or {}
+    tests = _res_pick(results, "att_bins_tests") or {}
     wcb_allzero_p = tests.get("allzero_p")
     wcb_equal_p = tests.get("equal_p")
     wcb_bins_info = tests.get("info")
 
     if wcb_bins_info is None and config is not None:
-        # Provide sensible defaults for display only
         wcb_bins_info = {
             "weights": getattr(config, "wcb_weights", "auto"),
             "B": getattr(config, "wcb_B", 9999),
@@ -607,18 +730,14 @@ def study_printable_from_didstudy(results: Dict[str, Any]) -> StudyPrintable:
             "method": "wcb" if getattr(config, "use_wcb", False) else "analytic",
         }
 
-    # Extract panel DataFrame for diagnostic plots
-    panel_df = results.get("panel")
-    if not isinstance(panel_df, pd.DataFrame):
-        panel_df = None
-
     return StudyPrintable(
         panel_info=panel_info,
         att_pooled=att_pooled,
         att_bins=bins_df,
         es_pooled=es_df,
         pta_pooled_p=pta_p,
-        honestdid=honest,
+        es_wcb_p=es_wcb,
+        honest_did=honest,
         support_by_tau=support_df,
         wcb_bins_allzero_p=wcb_allzero_p,
         wcb_bins_equal_p=wcb_equal_p,
@@ -649,14 +768,15 @@ def print_and_plot_summary(
     # Unified table:
     print_att_summary_table(sp.att_pooled, sp.att_bins)
     print_es_block(sp.es_pooled, sp.pta_pooled_p, sp.support_by_tau, sp.panel_df, panel_info=sp.panel_info)
-    print_honestdid_block(sp.honestdid)
+    print_honestdid_block(sp.honest_did)
     print_overall_support(
         sp.att_pooled,
         sp.pta_pooled_p,
         sp.att_bins,
         sp.wcb_bins_allzero_p,
-        sp.honestdid,
-        wcb_bins_info=sp.wcb_bins_info
+        sp.honest_did,
+        wcb_bins_info=sp.wcb_bins_info,
+        es_wcb_p=sp.es_wcb_p,
     )
 
     if make_combo and sp.att_bins is not None and len(sp.att_bins) > 0:
@@ -748,7 +868,7 @@ class StudyReporter:
         self.att = ATTReporter(self.sp.att_pooled, self.sp.att_bins, self.opts)
         self.bins = BinsReporter(self.sp.att_bins, self.sp.wcb_bins_allzero_p, self.sp.wcb_bins_equal_p, self.sp.wcb_bins_info, self.opts)
         self.es = ESReporter(self.sp.es_pooled, self.sp.pta_pooled_p, self.sp.support_by_tau, self.sp.panel_df, self.opts)
-        self.honest = HonestDidReporter(self.sp.honestdid, self.opts)
+        self.honest = HonestDidReporter(self.sp.honest_did, self.opts)
 
     @classmethod
     def from_didstudy(cls, results: Dict[str, Any], opts: Optional[StudyReportOptions] = None) -> "StudyReporter":
@@ -777,6 +897,15 @@ class StudyReporter:
         print_att_summary_table(self.sp.att_pooled, self.sp.att_bins)
         self.show_event_study()
         self.show_honestdid()
+        print_overall_support(
+            self.sp.att_pooled,
+            self.sp.pta_pooled_p,
+            self.sp.att_bins,
+            self.sp.wcb_bins_allzero_p,
+            self.sp.honest_did,
+            wcb_bins_info=self.sp.wcb_bins_info,
+            es_wcb_p=self.sp.es_wcb_p,
+        )
         # Optional super-figure (pooled + by-bin + ES)
         if self.opts.show_combo_figure and self.sp.att_bins is not None and len(self.sp.att_bins) > 0:
             pooled = {

@@ -167,7 +167,7 @@ class FigFinalizer:
         """Return a decorator that wraps a plotting function.
         
         The wrapped function should accept an `ax` kwarg and draw artists.
-        It should NOT set titles/labels/legend—those are handled here.
+        It should NOT set titles/labels/legend-those are handled here.
         """
         def decorator(plot_func: Callable[..., Dict[str, Any]]):
             def wrapper(
@@ -236,21 +236,18 @@ def plot_dose_distribution(
     """Histogram of dose levels with optional vertical lines at bin edges."""
     x = pd.Series(dose).dropna().values
     if bin_edges is not None:
-        # if edges include inf, drop for plotting vertical lines
-        finite_edges = [e for e in bin_edges if np.isfinite(e)]
+        finite_edges = [float(e) for e in bin_edges if np.isfinite(e)]
+        if len(finite_edges) < 2:
+            finite_edges = np.linspace(np.nanmin(x), np.nanmax(x), bins if bins > 1 else 2).tolist()
         for e in finite_edges:
-            ax.axvline(float(e), linestyle="--", linewidth=1, color="0.3", alpha=0.7, zorder=0)
-        # For histogram bins, clip to max observed
-        edges = [b for b in bin_edges if np.isfinite(b)]
-        if len(edges) == 0:
-            edges = np.linspace(np.nanmin(x), np.nanmax(x), 20).tolist()
-        ax.hist(x, bins=edges + [float(np.nanmax(x))], density=density, color=palette[0], alpha=0.85)
+            ax.axvline(e, linestyle="--", linewidth=1, color="0.3", alpha=0.7, zorder=0)
+        ax.hist(x, bins=finite_edges, density=density, color=palette[0], alpha=0.85)
     else:
         ax.hist(x, bins=bins, density=density, color=palette[0], alpha=0.85)
     return {"n": len(x)}
 
 
-@FIG(title="ATT$^{o}$ (pooled)", xlabel=None, ylabel="Effect (Δlog units)")
+@FIG(title="ATT$^{o}$ (pooled)", xlabel=None, ylabel="Effect (Deltalog units)")
 def plot_att_pooled_point(
     coef: float,
     lo: float,
@@ -265,7 +262,7 @@ def plot_att_pooled_point(
     return {}
 
 
-@FIG(title="ATT$^{o}$ (pooled + by bin)", xlabel=None, ylabel="Effect (Δlog units)")
+@FIG(title="ATT$^{o}$ (pooled + by bin)", xlabel=None, ylabel="Effect (Deltalog units)")
 def plot_att_combined(
     coef: float,
     lo: float,
@@ -276,87 +273,40 @@ def plot_att_combined(
     marker: str = "o",
     rotate_labels: int = 20,
 ) -> Dict[str, Any]:
-    """Box plot: pooled estimate and binned estimates with confidence intervals.
-    
-    The box represents the 95% confidence interval (q1 to q3), with the median line
-    at the point estimate. Since we're showing confidence intervals (not data distributions),
-    the whiskers are set equal to the CI bounds (no tails extending beyond). This is
-    appropriate for CI visualization where the box itself represents the uncertainty range.
     """
-    # Prepare data for box plot
-    positions = []
-    labels = []
-    data_for_box = []
-    
-    # Add pooled estimate
-    positions.append(0)
-    labels.append("Pooled")
-    # Box spans the 95% CI (q1=lo to q3=hi), whiskers at same bounds (no tails)
-    # This correctly represents that the CI is the uncertainty range
-    pooled_data = {
-        'med': coef,
-        'q1': lo,
-        'q3': hi,
-        'whislo': lo,  # Whisker at lower CI bound (no tail beyond)
-        'whishi': hi,  # Whisker at upper CI bound (no tail beyond)
-        'mean': coef,  # Required when showmeans=True
-    }
-    data_for_box.append(pooled_data)
-    
-    # Add binned estimates
-    if len(bins_df) > 0:
-        bins_labels = list(bins_df["bin"].astype(str))
-        coefs = bins_df["coef"].astype(float).values
-        los = bins_df["lo"].astype(float).values
-        his = bins_df["hi"].astype(float).values
-        
-        for i in range(len(bins_df)):
-            positions.append(i + 1)
-            labels.append(bins_labels[i])
-            bin_data = {
-                'med': coefs[i],
-                'q1': los[i],
-                'q3': his[i],
-                'whislo': los[i],  # Whisker at lower CI bound
-                'whishi': his[i],  # Whisker at upper CI bound
-                'mean': coefs[i],  # Required when showmeans=True
-            }
-            data_for_box.append(bin_data)
-    
-    # Create box plot using bxp
-    bp = ax.bxp(
-        data_for_box,
-        positions=positions,
-        widths=0.6,
-        patch_artist=True,
-        showmeans=False,  # Don't show mean marker since we have median
-        meanline=False,
-        showfliers=False,
-        showcaps=True,  # Show caps on whiskers (will appear at CI bounds)
-        manage_ticks=False,  # We'll set ticks manually
-    )
-    
-    # Color the boxes
-    for i, patch in enumerate(bp['boxes']):
-        if i == 0:
-            patch.set_facecolor(palette[0])
-            patch.set_alpha(0.7)
-        else:
-            patch.set_facecolor(palette[(i - 1) % len(palette) + 1])
-            patch.set_alpha(0.7)
-    
-    # Add horizontal line at y=0 for reference
-    ax.axhline(0, color='0.5', linestyle='--', linewidth=1, alpha=0.5, zorder=0)
-    
-    # Set x-axis labels
-    ax.set_xticks(positions)
+    ATT^o pooled + binned shown as points with 95% CI error bars
+    (instead of the current box-plot representation).
+    """
+    # 1) Build plotting rows: pooled first, then bins in their given order
+    rows = []
+    rows.append({"label": "Pooled", "coef": float(coef), "lo": float(lo), "hi": float(hi)})
+    # Expecting columns ['bin','coef','lo','hi'] in bins_df
+    for _, r in bins_df.iterrows():
+        rows.append({"label": str(r["bin"]), "coef": float(r["coef"]), "lo": float(r["lo"]), "hi": float(r["hi"])})
+
+    # 2) X positions and aesthetics
+    x = np.arange(len(rows))
+    labels = [r["label"] for r in rows]
+
+    # 3) Draw: vertical errorbars with centered point
+    for i, r in enumerate(rows):
+        y = r["coef"]
+        yerr = np.array([[y - r["lo"]], [r["hi"] - y]])  # asymmetric (lo, hi)
+        ax.errorbar(
+            x[i], y, yerr=yerr, fmt=marker, capsize=3, elinewidth=1.5, linewidth=0,
+            zorder=3, color=palette[0] if i == 0 else palette[(i % (len(palette) - 1)) + 1]
+        )
+
+    # 4) Reference line and axes cosmetics
+    ax.axhline(0, linestyle="--", linewidth=1, color="0.6", zorder=0)
+    ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=rotate_labels, ha="right")
-    ax.set_xlim(-0.5, len(positions) - 0.5)
-    
+    ax.set_xlim(-0.5, len(x) - 0.5)
+
     return {}
 
 
-@FIG(title="ATT$^{o}$ by dose bin", xlabel=None, ylabel="Effect (Δlog units)")
+@FIG(title="ATT$^{o}$ by dose bin", xlabel=None, ylabel="Effect (Deltalog units)")
 def plot_att_binned_points(
     bins_labels: Sequence[str],
     coef: Sequence[float],
@@ -384,7 +334,7 @@ def plot_att_binned_points(
     return {}
 
 
-@FIG(title="Event study (pooled)", xlabel="Event time τ", ylabel="Effect (Δlog units)")
+@FIG(title="Event study (pooled)", xlabel="Event time tau", ylabel="Effect (Deltalog units)")
 def plot_event_study_line(
     df_es: pd.DataFrame,
     ax: plt.Axes,
@@ -419,7 +369,7 @@ def plot_event_study_line(
     # Connect points with a line
     ax.plot(x, beta, linewidth=1.5, color=palette[0], alpha=0.5, zorder=0)
 
-    # Reference τ = -1
+    # Reference tau = -1
     if ref_tau is not None:
         ax.axvline(float(ref_tau), color="0.2", linestyle="-", linewidth=1.2, alpha=0.7)
 
@@ -427,7 +377,7 @@ def plot_event_study_line(
 
 
 @FIG(title="HonestDiD M-sensitivity", xlabel="M (relative magnitude bound)", ylabel="Bounded effect interval")
-def plot_honestdid_mcurve(
+def plot_honest_did_M_curve(
     m_grid: Sequence[float],
     lo: Sequence[float],
     hi: Sequence[float],
@@ -436,7 +386,7 @@ def plot_honestdid_mcurve(
     palette: Sequence[str],
     show_frontier: bool = True,
 ) -> Dict[str, Any]:
-    """Plot HonestDiD lower/upper bounds vs M and overlay θ̂."""
+    """Plot HonestDiD lower/upper bounds vs M and overlay theta_hat."""
     m = np.asarray(m_grid, dtype=float)
     lo = np.asarray(lo, dtype=float)
     hi = np.asarray(hi, dtype=float)
@@ -453,18 +403,18 @@ def plot_honestdid_mcurve(
         inside = (lo <= 0) & (0 <= hi)
         if inside.any():
             idx = int(np.argmax(inside))  # first True
-            ax.axvline(m[idx], color="0.4", linestyle="--", label=f"M*≈{m[idx]:.2g}")
+            ax.axvline(m[idx], color="0.4", linestyle="--", label=f"M*~={m[idx]:.2g}")
 
     return {}
 
 
-@FIG(title="Pre-trend support (units by lead τ)", xlabel="Event time τ (leads only)", ylabel="Units")
+@FIG(title="Pre-trend support (units by lead tau)", xlabel="Event time tau (leads only)", ylabel="Units")
 def plot_support_by_tau(
     df_support: pd.DataFrame,
     ax: plt.Axes,
     palette: Sequence[str],
 ) -> Dict[str, Any]:
-    """Bar chart: number of units contributing at each lead τ (pooled)."""
+    """Bar chart: number of units contributing at each lead tau (pooled)."""
     # Expect columns: event_time, units (>=0)
     d = df_support.copy()
     d = d[d["event_time"] < 0].sort_values("event_time")
@@ -472,7 +422,7 @@ def plot_support_by_tau(
     return {}
 
 
-@FIG(title="Mean dose by event time", xlabel="Event time τ", ylabel="Mean dose")
+@FIG(title="Mean dose by event time", xlabel="Event time tau", ylabel="Mean dose")
 def plot_mean_dose_by_tau(
     df_panel: pd.DataFrame,
     ax: plt.Axes,
@@ -546,7 +496,7 @@ def plot_mean_dose_by_tau(
         grouped = grouped.sort_values([event_time_col, bin_col])
         
         # Compute 95% CI using SEM (standard error of mean)
-        # SEM = std / sqrt(n), CI = mean ± 1.96 * SEM
+        # SEM = std / sqrt(n), CI = mean +/- 1.96 * SEM
         # Handle cases with few observations
         grouped['std'] = grouped['std'].fillna(0.0)
         grouped['sem'] = grouped['std'] / np.sqrt(grouped['count'].clip(lower=2))
@@ -600,7 +550,7 @@ def plot_mean_dose_by_tau(
     if n_series > 1:
         ax.legend(loc='best', fontsize=10, frameon=False)
     
-    # Reference τ = -1
+    # Reference tau = -1
     if ref_tau is not None:
         ax.axvline(float(ref_tau), color="0.2", linestyle="-", linewidth=1.2, alpha=0.7)
     
@@ -628,7 +578,7 @@ def plot_att_combo(
         hi=float(pooled["hi"]),
         ax=axes[0],
         title="ATT$^{o}$ (pooled)",
-        ylabel="Effect (Δlog units)",
+        ylabel="Effect (Deltalog units)",
     )
     # Binned
     plot_att_binned_points(
@@ -642,7 +592,7 @@ def plot_att_combo(
     )
     # ES
     plot_event_study_line(
-        es_df, ax=axes[2], title="Event study (pooled)", xlabel="Event time τ", ylabel=None
+        es_df, ax=axes[2], title="Event study (pooled)", xlabel="Event time tau", ylabel=None
     )
     FIG.finalize(fig, axes, suptitle=suptitle, save=save, show=show)
     return fig

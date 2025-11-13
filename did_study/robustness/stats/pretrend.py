@@ -1,17 +1,17 @@
 """
-Pre‑trend diagnostic tests for event studies.
+Pre-trend diagnostic tests for event studies.
 
 This module implements joint and linear tests for assessing the
 parallel trends assumption in event study regressions.  The focus is
-on identifying whether the lead coefficients (pre‑treatment periods)
+on identifying whether the lead coefficients (pre-treatment periods)
 are jointly zero (joint pretest) or follow a linear trend (slope
 test).  These tests should be used for reporting rather than for
-conditioning decisions【14963393938263†L7-L16】, since pre‑testing can
-distort inference【14963393938263†L28-L33】.
+conditioning decisions[14963393938263^L7-L16], since pre-testing can
+distort inference[14963393938263^L28-L33].
 
 The functions here operate on a fitted statsmodels OLS result with
-cluster‑robust covariance already computed.  They return test
-statistics and p‑values for the relevant hypotheses.
+cluster-robust covariance already computed.  They return test
+statistics and p-values for the relevant hypotheses.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from scipy.stats import chi2
 
 
 def joint_pretest_zero(result, pre_param_names: Sequence[str]) -> Dict[str, Any]:
-    """Wald test that all specified pre‑treatment coefficients are zero.
+    """Wald test that all specified pre-treatment coefficients are zero.
 
     Parameters
     ----------
@@ -31,13 +31,13 @@ def joint_pretest_zero(result, pre_param_names: Sequence[str]) -> Dict[str, Any]
         Fitted regression result.  Must have attributes ``params`` and
         ``cov_params``.
     pre_param_names : sequence of str
-        Names of coefficients corresponding to pre‑treatment (lead)
+        Names of coefficients corresponding to pre-treatment (lead)
         indicators in the event study.
 
     Returns
     -------
     dict
-        Dictionary with keys ``stat`` (chi‑square statistic), ``df``
+        Dictionary with keys ``stat`` (chi-square statistic), ``df``
         (degrees of freedom), ``p_value`` and ``tested`` (the subset of
         names actually found in the model).
     """
@@ -48,7 +48,7 @@ def joint_pretest_zero(result, pre_param_names: Sequence[str]) -> Dict[str, Any]
     V = result.cov_params().loc[names, names].to_numpy(float)
     # symmetrise covariance
     V = 0.5 * (V + V.T)
-    # invert with pseudo‑inverse for stability
+    # invert with pseudo-inverse for stability
     Vinv = np.linalg.pinv(V, rcond=1e-12)
     stat = float(b.T @ Vinv @ b)
     k = len(names)
@@ -57,17 +57,17 @@ def joint_pretest_zero(result, pre_param_names: Sequence[str]) -> Dict[str, Any]
 
 
 def linear_weights_from_event_times(pre_event_times: Sequence[int]) -> np.ndarray:
-    """Construct mean‑zero unit‑norm linear weights for pre‑trend testing.
+    """Construct mean-zero unit-norm linear weights for pre-trend testing.
 
     Given a sequence of event times (negative integers), this function
     returns a vector of weights proportional to the event times, centred
     to have mean zero and scaled to unit L2 norm.  These weights are
-    typically used to test for a linear pre‑trend.
+    typically used to test for a linear pre-trend.
 
     Parameters
     ----------
     pre_event_times : sequence of int
-        Event times corresponding to the pre‑treatment coefficients (e.g.
+        Event times corresponding to the pre-treatment coefficients (e.g.
         ``[-5, -4, -3, -2]``).  Do not include the omitted baseline period.
 
     Returns
@@ -88,9 +88,9 @@ def pre_slope_test(
     weights: Optional[Sequence[float]] = None,
     pre_event_times: Optional[Sequence[int]] = None,
 ) -> Dict[str, Any]:
-    """Test a linear trend in the pre‑treatment coefficients.
+    """Test a linear trend in the pre-treatment coefficients.
 
-    This test evaluates whether a weighted sum of the pre‑treatment
+    This test evaluates whether a weighted sum of the pre-treatment
     coefficients equals zero.  If ``weights`` is provided it must
     align with ``pre_param_names``.  Otherwise, if ``pre_event_times``
     are given, weights are constructed proportional to the event times
@@ -99,19 +99,19 @@ def pre_slope_test(
     Parameters
     ----------
     result : statsmodels.regression.linear_model.RegressionResultsWrapper
-        Fitted regression result with cluster‑robust covariance.
+        Fitted regression result with cluster-robust covariance.
     pre_param_names : sequence of str
-        Names of the pre‑treatment coefficient parameters.
+        Names of the pre-treatment coefficient parameters.
     weights : sequence of float or None, optional
         Weights applied to the coefficients.  If ``None`` use
         ``pre_event_times``.
     pre_event_times : sequence of int or None, optional
-        Event times corresponding to the pre‑treatment coefficients.
+        Event times corresponding to the pre-treatment coefficients.
 
     Returns
     -------
     dict
-        Dictionary with keys ``stat`` (chi‑square statistic), ``df`` (1),
+        Dictionary with keys ``stat`` (chi-square statistic), ``df`` (1),
         ``p_value``, ``contrast`` (the normalised weight vector) and
         ``tested`` (names tested).
     """

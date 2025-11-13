@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, Optional, Sequence, Set
 
 import pandas as pd
 
@@ -14,10 +14,10 @@ from did_study.estimators.event_study import EventStudyResult, event_study
 
 class DidEstimator(BaseEstimator):
     """
-    Thin façade over the actual estimator functions.
+    Thin facade over the actual estimator functions.
 
-    We keep this file deliberately small — this is the place where we can
-    do “safety” logic (e.g. fall back to Python-only for fragile
+    We keep this file deliberately small - this is the place where we can
+    do "safety" logic (e.g. fall back to Python-only for fragile
     per-bin event studies) without polluting the core estimators.
     """
 
@@ -27,20 +27,35 @@ class DidEstimator(BaseEstimator):
     # ---------------------------------------------------------
     # ATT^o (pooled, continuous-dose building block)
     # ---------------------------------------------------------
-    def estimate_att_o(self, panel: PanelData) -> AttResult:
-        return estimate_att_o(panel, self.config)
+    def estimate_att_o(
+        self,
+        panel: PanelData,
+        fe_terms: Optional[Sequence[str]] = None,
+        wcb_args: Optional[Dict[str, Any]] = None,
+    ) -> AttResult:
+        return estimate_att_o(panel, self.config, fe_terms=fe_terms, wcb_args=wcb_args)
 
     # ---------------------------------------------------------
     # Binned ATT^o
     # ---------------------------------------------------------
-    def estimate_binned_att_o(self, panel: PanelData) -> BinAttResult | pd.DataFrame:
-        return estimate_binned_att_o(panel, self.config)
+    def estimate_binned_att_o(
+        self,
+        panel: PanelData,
+        fe_terms: Optional[Sequence[str]] = None,
+        wcb_args: Optional[Dict[str, Any]] = None,
+    ) -> BinAttResult | pd.DataFrame:
+        return estimate_binned_att_o(panel, self.config, fe_terms=fe_terms, wcb_args=wcb_args)
 
     # ---------------------------------------------------------
     # Event study (pooled)
     # ---------------------------------------------------------
-    def event_study(self, panel: PanelData) -> EventStudyResult:
-        return event_study(panel, self.config)
+    def event_study(
+        self,
+        panel: PanelData,
+        fe_terms: Optional[Sequence[str]] = None,
+        wcb_args: Optional[Dict[str, Any]] = None,
+    ) -> EventStudyResult:
+        return event_study(panel, self.config, fe_terms=fe_terms, wcb_args=wcb_args)
 
     # ---------------------------------------------------------
     # Event study by *dose bin*
@@ -48,21 +63,6 @@ class DidEstimator(BaseEstimator):
     def event_study_by_bin(self, panel: PanelData) -> Dict[Any, EventStudyResult]:
         """
         Return {bin_label: EventStudyResult}.
-
-        This is the place where the original code was blowing up for you:
-        when we subset to a single bin, the R wild-cluster path often
-        can’t be fit (too many FE, too few obs, param names change).
-
-        Strategy here:
-          1. assign each unit to exactly one bin;
-          2. for each bin, take *all* rows for those units (pre + post);
-          3. TRY a normal ES with the user's config;
-          4. if it errors (typically R “subscript out of bounds”), RETRY
-             with a **safe** config:
-                - r_bridge = False
-                - use_wcb = False
-                - honestdid_enable = False
-          5. if that still fails, we just skip this bin.
         """
         dfu = panel.panel.copy()
         year_col = getattr(self.config, "year_col", "Year")
@@ -100,7 +100,7 @@ class DidEstimator(BaseEstimator):
                 .rename(columns={"dose_bin": "unit_bin"})
             )
 
-        # units that still have no bin → use modal bin over time
+        # units that still have no bin -> use modal bin over time
         all_units: Set[Any] = set(dfu[unit_col].unique())
         assigned_units: Set[Any] = set(post_first[unit_col].unique())
         missing_units = list(all_units - assigned_units)
@@ -113,7 +113,7 @@ class DidEstimator(BaseEstimator):
                 .rename(columns={"size": "n"})
             )
             if not tmp.empty:
-                # for each unit → pick bin with biggest n
+                # for each unit -> pick bin with biggest n
                 idx = (
                     tmp.sort_values([unit_col, "n"], ascending=[True, False])
                     .groupby(unit_col)
@@ -160,7 +160,7 @@ class DidEstimator(BaseEstimator):
             n_post = int((sub["post"] == 1).sum()) if "post" in sub.columns else 0
             n_years = sub[year_col].nunique() if year_col in sub.columns else 0
             if n_post == 0:
-                # no treated time → no ES
+                # no treated time -> no ES
                 continue
             if n_years < max(self.config.pre, self.config.min_pre) + self.config.min_post:
                 # panel too short for usual ES window
@@ -171,14 +171,14 @@ class DidEstimator(BaseEstimator):
                     es_b = event_study(pv, safe_cfg)
                     out[b] = es_b
                 except Exception:
-                    # really not estimable → skip
+                    # really not estimable -> skip
                     continue
                 continue
 
             try:
                 pre_leads = int((sub["event_time"].astype("Float64") <= -2).sum()) if "event_time" in sub.columns else 0
                 post_rows = int((sub.get("post", 0) == 1).sum())
-                print(f"[ES-by-bin] bin {b}: pre-leads (τ<=-2)={pre_leads}, post rows={post_rows}, units={len(units_b)}")
+                print(f"[ES-by-bin] bin {b}: pre-leads (tau<=-2)={pre_leads}, post rows={post_rows}, units={len(units_b)}")
 
                 if post_rows == 0:
                     print(f"[ES-by-bin] skip bin {b}: no treated rows (post==1) in this subset.")
@@ -203,11 +203,3 @@ class DidEstimator(BaseEstimator):
         cfg.use_wcb = False          # don't even try WCB on very small bin
         cfg.honestdid_enable = False # we only do HonestDiD at top level
         return cfg
-
-
-__all__ = [
-    "DidEstimator",
-    "AttResult",
-    "BinAttResult",
-    "EventStudyResult",
-]

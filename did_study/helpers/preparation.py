@@ -78,13 +78,13 @@ def _sum_cols_block(df: pd.DataFrame, prefix: str) -> pd.Series:
 # ----------------------------
 class PanelData:
     """
-    Country(/CCUS) × Year panel with:
-      • absorbing adoption (once treated, always treated),
-      • CY Supply/Demand merged after adoption timing is built,
-      • PCA/covariates fit on pre rows only (never- or not-yet-treated),
-      • absorbing dose bins (cohort = first post bin),
-      • optional direct allocation of emissions to CCUS sectors,
-      • leakage-safe transformations and scaling.
+    Country(/CCUS) x Year panel with:
+      - absorbing adoption (once treated, always treated),
+      - CY Supply/Demand merged after adoption timing is built,
+      - PCA/covariates fit on pre rows only (never- or not-yet-treated),
+      - absorbing dose bins (cohort = first post bin),
+      - optional direct allocation of emissions to CCUS sectors,
+      - leakage-safe transformations and scaling.
 
     Use via `prepare_ccus_panel(StudyConfig)`.
     """
@@ -175,7 +175,7 @@ class PanelData:
                     edges_used = ed
                     method_used = "quantiles"
 
-        # (c) convenience: n_bins → quantile edges
+        # (c) convenience: n_bins -> quantile edges
         elif hasattr(cfg, "n_bins") and getattr(cfg, "n_bins", None):
             try:
                 n = int(cfg.n_bins)
@@ -199,11 +199,11 @@ class PanelData:
             dose_col="dose_level",
             edges=edges_used,
             quantiles=None,
-            include_untreated=False,  # keep NaN for non-positive dose
+            include_untreated=True,
             untreated_label="untreated",
             right=getattr(cfg, "dose_bins_right_closed", False),
             precision=2,
-        )
+         )
         tmp = g.assign(_raw_bin=raw_c)
 
         # first post-treatment bin per unit (absorbing)
@@ -233,9 +233,20 @@ class PanelData:
 
         print(f"[prepare][bins] absorbing ({method_used}); edges={support['edges']}")
         for b in sorted([x for x in post_rows["dose_bin"].dropna().unique()], key=str):
+            if str(b) == "untreated":
+                continue
             u = int(sup_units.get(b, 0))
             r = int(sup_rows.get(b, 0))
-            print(f"  - {b}: units={u}, rows={r}")
+            doses = g.loc[(g["dose_bin"] == b) & (g["post"] == 1), "dose_level"]
+            if doses.empty:
+                print(f"  - {b}: units={u}, rows={r}")
+                continue
+            mean_dose = doses.mean()
+            cv = (doses.std() / mean_dose) if mean_dose not in (0, np.nan) else np.nan
+            msg = f"  - {b}: units={u}, rows={r}, dose range=[{doses.min():.1f}, {doses.max():.1f}]"
+            if np.isfinite(cv):
+                msg += f", CV={cv:.2f}"
+            print(msg)
 
         return g, support
 
@@ -261,10 +272,11 @@ class PanelData:
         # ---------- (0) Base unit grid & dose ----------
         if cfg.outcome_mode == "total":
             grid = d[[country_col, cfg.year_col]].drop_duplicates()
+            cap_source = d[[country_col, cfg.year_col, cfg.capacity_col]].drop_duplicates()
             cap = (
-                d.groupby([country_col, cfg.year_col], as_index=False)[cfg.capacity_col]
-                 .sum()
-                 .rename(columns={cfg.capacity_col: "dose_level"})
+                cap_source.groupby([country_col, cfg.year_col], as_index=False)[cfg.capacity_col]
+                    .sum()
+                    .rename(columns={cfg.capacity_col: "dose_level"})
             )
             g = (
                 grid.merge(cap, on=[country_col, cfg.year_col], how="left")
@@ -274,10 +286,11 @@ class PanelData:
             unit_level = "country"
         else:
             grid = d[[country_col, ccus_col, cfg.year_col]].drop_duplicates()
+            cap_source = d[[country_col, ccus_col, cfg.year_col, cfg.capacity_col]].drop_duplicates()
             cap = (
-                d.groupby([country_col, ccus_col, cfg.year_col], as_index=False)[cfg.capacity_col]
-                 .sum()
-                 .rename(columns={cfg.capacity_col: "dose_level"})
+                cap_source.groupby([country_col, ccus_col, cfg.year_col], as_index=False)[cfg.capacity_col]
+                    .sum()
+                    .rename(columns={cfg.capacity_col: "dose_level"})
             )
             g = (
                 grid.merge(cap, on=[country_col, ccus_col, cfg.year_col], how="left")
@@ -289,14 +302,14 @@ class PanelData:
         g["dose_level"] = g["dose_level"].fillna(0.0)
         g["treated_now"] = (g["dose_level"] > cfg.treat_threshold).astype(int)
 
-        # ---------- (1) Outcome (y_level → log/Δlog or level/Δ) ----------
+        # ---------- (1) Outcome (y_level -> log/Deltalog or level/Delta) ----------
         used_outcome_mode = cfg.outcome_mode
         if cfg.outcome_mode == "direct":
             emap = (mapping or {}).get("emissions_to_ccus", {})
             if not _em_map_is_partition(emap) and getattr(cfg, "mapping_weights", None) is None:
                 raise ValueError("[prepare] emissions_to_ccus mapping must be a partition or provide mapping_weights.")
             if unit_level != "sector":
-                raise ValueError("[prepare] direct mode requires sector units (Country×CCUS_sector).")
+                raise ValueError("[prepare] direct mode requires sector units (CountryxCCUS_sector).")
             y_ccus = self._alloc_emissions_to_ccus(
                 d,
                 country_col=country_col, year_col=cfg.year_col,
@@ -328,7 +341,7 @@ class PanelData:
             used_outcome_mode = "custom"
 
         if cfg.outcome_mode == "total" and unit_level == "sector":
-            raise ValueError("Outcome is country-total but units are Country×CCUS_sector.")
+            raise ValueError("Outcome is country-total but units are CountryxCCUS_sector.")
 
         # outcome transform
         g = g.sort_values(["unit_id", cfg.year_col]).copy()
@@ -408,7 +421,7 @@ class PanelData:
         )
         g["renewable_to_fossil_supply_ratio"] = (sup_ren + eps_unit) / (sup_fos + eps_unit)
 
-        # Fuel mix shares — build nuclear share and its lag/diff unconditionally
+        # Fuel mix shares - build nuclear share and its lag/diff unconditionally
         sup_nuc = _sum_cols_block(g, "Supply_nuclear")
         mix_den = sup_nuc + sup_ren + sup_fos
         eps_mix = (
@@ -598,7 +611,7 @@ class PanelData:
                 covs_scaler_path = os.path.join(cfg.artifact_dir, "covariates_scaler_prefit.joblib")
                 _joblib.dump({"scaler": scaler, "columns": covar_cols_used, "pre_medians": pre_medians},
                              covs_scaler_path)
-                print(f"[prepare] Saved covariates scaler → {covs_scaler_path}")
+                print(f"[prepare] Saved covariates scaler -> {covs_scaler_path}")
 
         # ---------- (7) Trim units by support (differencing-aware) ----------
         effective_min_pre = max(1, cfg.min_pre - (1 if cfg.differenced else 0))
@@ -667,6 +680,8 @@ class PanelData:
             "dose_bin_support": dose_bin_support,
             "dose_bin_method": (dose_bin_support or {}).get("method"),
             "dose_bin_edges": (dose_bin_support or {}).get("edges"),
+            "pre": int(getattr(cfg, "pre", 0)),
+            "post": int(getattr(cfg, "post", 0)),
             "pre": int(getattr(cfg, "pre", 0)),
             "post": int(getattr(cfg, "post", 0)),
             "cohort_counts": cohort_counts.to_dict(),

@@ -10,7 +10,12 @@ robustness statistics submodule for convenience.
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+try:  # Optional, only needed for pretty-printing
+    import pandas as pd  # type: ignore
+except Exception:  # pragma: no cover - pandas always available in runtime
+    pd = None  # type: ignore
 
 # Reexport the analytic MDE function from the robustness subpackage.
 from ..robustness.stats.mde import analytic_mde_from_se  # type: ignore
@@ -23,7 +28,7 @@ def choose_wcb_weights_and_B(
 ) -> Tuple[str, int]:
     """Choose the weight distribution and replication count for the wild cluster bootstrap.
 
-    Simulation evidence suggests using the Webb six‑point distribution when
+    Simulation evidence suggests using the Webb six-point distribution when
     the number of clusters is between five and twelve, and the
     Rademacher distribution otherwise.  The default number of
     bootstrap replications depends on the weight type: 9,999 for
@@ -54,4 +59,78 @@ def choose_wcb_weights_and_B(
     return wt, B
 
 
-__all__ = ["choose_wcb_weights_and_B", "analytic_mde_from_se"]
+def resolve_fe_terms(
+    fe_terms: Optional[Sequence[str]],
+    year_col: str = "Year",
+    unit_col: str = "unit_id",
+    *,
+    fallback: Optional[Sequence[str]] = None,
+) -> List[str]:
+    """Return a de-duplicated list of FE identifiers aligned with the data columns."""
+    source = fe_terms if fe_terms is not None else fallback
+    if source is None:
+        return []
+
+    resolved: List[str] = []
+    year_key = str(year_col).lower()
+    unit_key = str(unit_col).lower()
+
+    for term in source:
+        if term is None:
+            continue
+        raw = str(term).strip()
+        if not raw:
+            continue
+        key = raw.lower()
+        if key in {"year", year_key}:
+            name = year_col
+        elif key in {"unit", "unit_id", unit_key}:
+            name = unit_col
+        else:
+            name = raw
+        if name not in resolved:
+            resolved.append(name)
+    return resolved
+
+
+__all__ = ["choose_wcb_weights_and_B", "analytic_mde_from_se", "resolve_fe_terms"]
+
+
+def log_wcb_call(
+    *,
+    file_name: str,
+    func_name: str,
+    params: Optional[Dict[str, Any]] = None,
+    dataframes: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Pretty-print the arguments supplied to a WCB helper."""
+    line = "=" * 72
+    print(f"\n{line}")
+    print(f"[WCB CALL] {file_name} -> {func_name}")
+    print(line)
+
+    if params:
+        print("Parameters:")
+        for key, val in params.items():
+            print(f"  - {key}: {val}")
+
+    if dataframes:
+        for name, obj in dataframes.items():
+            print(f"\n[{name} head]")
+            if pd is not None and isinstance(obj, pd.DataFrame):
+                with pd.option_context("display.max_rows", 5, "display.max_columns", 10, "display.width", 120):
+                    print(obj.head().to_string(index=False))
+            else:
+                head_func = getattr(obj, "head", None)
+                if callable(head_func):
+                    try:
+                        preview = head_func()
+                        print(preview)
+                    except Exception:
+                        print(repr(obj))
+                else:
+                    print(repr(obj))
+    print(line + "\n")
+
+
+__all__.append("log_wcb_call")

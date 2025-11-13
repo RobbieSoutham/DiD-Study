@@ -1,125 +1,122 @@
-"""Pooled Average Treatment on the Treated (ATT^o) estimator.
-
-Implements the collapsed‑regression estimator for ATT^o under staggered
-adoption with continuous dose collapsed to a contemporaneous treated
-indicator (absorbing). Returns coefficient, CRSE, analytic p, WCB p,
-95% CI and MDE. Designed to match the design used elsewhere in the
-package and to be reproducible via seed plumbing.
-"""
-
+# did_study/estimators/att.py
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List
-
-import numpy as np
+from typing import Dict, Any, List, Optional, Sequence
 import pandas as pd
+import numpy as np
 import statsmodels.formula.api as smf
 
 from ..helpers.config import StudyConfig
-from ..helpers.utils import choose_wcb_weights_and_B
+from ..helpers.utils import log_wcb_call
+from ..robustness.wcb import TestSpec, make_wcb_runner
 from ..robustness.stats.mde import analytic_mde_from_se
-from ..robustness.wcb import wcb_att_pvalue_r
-
 
 @dataclass
 class AttResult:
-    """Container for an estimated pooled treatment effect."""
-
-    coef: float
-    se: float
-    p: float
-    n_clusters: int
-    n_obs: int
+    coef: float | np.nan
+    se: float | np.nan
+    p: float | np.nan
     p_wcb: float | np.nan
-    lo: float
-    hi: float
-    mde: float
+    model: Any
+    used: pd.DataFrame
 
-
-def estimate_att_o(panel: PanelData, config: StudyConfig) -> AttResult:
-    """Estimate pooled ATT^o via collapsed regression with cluster‑robust SEs.
-
-    Parameters
-    ----------
-    panel : PanelData
-        Prepared panel with outcome, `treated_now`, covariates and FE identifiers.
-    config : StudyConfig
-        Includes FE flags, cluster id, bootstrap controls and seed.
-    """
+def estimate_att_o(
+    panel,
+    config: StudyConfig,
+    fe_terms: Optional[Sequence[str]] = None,
+    *,
+    wcb_args: Optional[Dict[str, Any]] = None,
+) -> AttResult:
     df = panel.panel.copy()
-    if df.empty:
-        raise ValueError("Panel is empty; cannot estimate ATT.")
-
-    cfg = config
-    y = panel.outcome_name
+    outcome = panel.outcome_name
     cluster_col = "unit_id"
-    year_col = cfg.year_col
-    covs: List[str] = panel.info.get("covariates_used", []) or []  # type: ignore
+    year_col = config.year_col
 
-    rhs_terms = ["treated_now"] + covs + [f"C({year_col})"]
-    include_unit_fe = not y.lower().startswith("d_")
-    if include_unit_fe:
-        rhs_terms.append(f"C({cluster_col})")
+    include_unit_fe_default = not outcome.lower().startswith("d_")
+    default_fe: List[str] = [year_col]
+    if include_unit_fe_default:
+        default_fe.insert(0, cluster_col)
+    fe_terms = list(fe_terms) if fe_terms else default_fe
 
-    formula = f"{y} ~ " + " + ".join(rhs_terms)
-    required = [y, "treated_now", year_col, cluster_col] + covs
-    used = df.dropna(subset=[c for c in required if c in df.columns]).copy()
-
+    covs = panel.info.get("covariates_used", []) or []
+    need = [outcome, "treated_now", cluster_col, year_col] + covs
+    used = df.dropna(subset=[c for c in need if c in df.columns]).copy()
     if used.empty or used[cluster_col].nunique() < 2:
-        raise ValueError("Not enough usable data or clusters to estimate ATT.")
+        return AttResult(np.nan, np.nan, np.nan, np.nan, None, used)
+
+    fe_rhs = [f"C({c})" for c in fe_terms]
+    rhs = ["treated_now"] + covs + fe_rhs
+    formula = f"{outcome} ~ " + " + ".join(rhs)
 
     groups = pd.factorize(used[cluster_col])[0]
-    mod = smf.ols(formula, data=used).fit(cov_type="cluster", cov_kwds={"groups": groups})
+    m = smf.ols(formula, data=used).fit(cov_type="cluster", cov_kwds={"groups": groups})
+    coef = float(m.params.get("treated_now", np.nan))
+    se = float(m.bse.get("treated_now", np.nan))
+    p = float(m.pvalues.get("treated_now", np.nan))
 
-    coef = float(mod.params.get("treated_now", np.nan))
-    se = float(mod.bse.get("treated_now", np.nan))
-    pval = float(mod.pvalues.get("treated_now", np.nan))
     n_clusters = int(used[cluster_col].nunique())
     n_obs = int(len(used))
-
-    # t‑based 95% CI using G−1 dof
-    df_eff = max(n_clusters - 1, 1)
-    try:
-        from scipy.stats import t as _t
-        tcrit = _t.ppf(0.975, df_eff)
-    except Exception:
-        from statistics import NormalDist
-        tcrit = NormalDist().inv_cdf(0.975)
-    lo = coef - tcrit * se
-    hi = coef + tcrit * se
-
-    mde = analytic_mde_from_se(se, n_clusters)
-
-    # Wild cluster bootstrap p‑value (R bridge)
-    p_wcb: float | np.nan = np.nan
-    if bool(getattr(cfg, "use_wcb", True)):
-        wt, BB = choose_wcb_weights_and_B(n_clusters, getattr(cfg, "wcb_weights", None), getattr(cfg, "wcb_B", None))
+    mde_val = float("nan")
+    if np.isfinite(se) and n_clusters > 1:
         try:
-            p_wcb = wcb_att_pvalue_r(
-                used,
-                outcome=y,
-                regressors=["treated_now"] + covs,
-                fe=[year_col] + ([cluster_col] if include_unit_fe else []),
-                cluster=cluster_col,
-                param="treated_now",
-                B=int(BB),
-                weights=wt,
-                seed=int(getattr(cfg, "seed", 123) or 123),
-                impose_null=True,
-            )
-        except Exception as e:  # pragma: no cover — robust to missing R
-            print(f"[WCB] failed: {e}")
-            p_wcb = np.nan
+            mde_val = analytic_mde_from_se(se, n_clusters)
+        except Exception:
+            mde_val = float("nan")
 
-    return AttResult(
-        coef=coef,
-        se=se,
-        p=pval,
-        n_clusters=n_clusters,
-        n_obs=n_obs,
-        p_wcb=p_wcb,
-        lo=lo,
-        hi=hi,
-        mde=mde,
-    )
+    p_wcb = np.nan
+    if wcb_args:
+        try:
+            base_terms = ["treated_now"] + covs
+            cluster_spec = (
+                wcb_args.get("cluster_terms")
+                or wcb_args.get("cluster_spec")
+                or cluster_col
+            )
+            if isinstance(cluster_spec, str):
+                cluster_list = [cluster_spec]
+            else:
+                cluster_list = list(cluster_spec or [])
+            cluster_list = [c for c in cluster_list if c in used.columns]
+            if not cluster_list:
+                cluster_list = [cluster_col]
+
+            impose_null = bool(wcb_args.get("impose_null", True))
+            B = int(wcb_args.get("B", 9999))
+            weights = wcb_args.get("weights", "rademacher")
+            seed = wcb_args.get("seed")
+
+            candidate_cols = (
+                [outcome, cluster_col, year_col]
+                + base_terms
+                + fe_terms
+                + cluster_list
+            )
+            wcb_cols: List[str] = []
+            for col in candidate_cols:
+                if col in used.columns and col not in wcb_cols:
+                    wcb_cols.append(col)
+            wcb_df = used[wcb_cols].copy()
+
+            runner = make_wcb_runner(
+                df=wcb_df,
+                outcome=outcome,
+                regressors=base_terms,
+                fe=list(fe_terms or []),
+                cluster=cluster_list,
+                B=B,
+                weights=weights,
+                impose_null=impose_null,
+                seed=seed,
+            )
+            p_wcb = runner.pvalue(TestSpec(param="treated_now"))
+        except Exception as e:
+            print("[WCB] failed; returning NaN. Reason:", repr(e))
+
+    result = AttResult(coef, se, p, p_wcb, m, used)
+    result.n_clusters = n_clusters
+    result.clusters = n_clusters
+    result.n_obs = n_obs
+    result.n = n_obs
+    result.mde = mde_val
+    return result

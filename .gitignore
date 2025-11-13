@@ -28,6 +28,7 @@ dist/
 .eggs/
 *.egg-info/
 *.egg
+did_study.egg-info/
 
 # Jupyter
 .ipynb_checkpoints/

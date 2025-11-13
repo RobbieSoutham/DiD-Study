@@ -1,281 +1,357 @@
-# r_interface.py
-"""
-R interop for Wild Cluster Bootstrap (fwildclusterboot) using fixest::feols.
-
-Public API
-----------
-- wcb_att_pvalue_r
-- wcb_joint_pvalue_r
-- wcb_equal_bins_pvalue_r
-
-Compat helpers
---------------
-- to_r_ready_df(df, needed_cols=None, year_col=None, cluster_col=None) -> (clean_df, name_map)
-- py_df_to_r(df)
-"""
-
+# did_study/robustness/r_interface.py
 from __future__ import annotations
-from typing import List, Optional, Sequence, Tuple, Dict
-import re
+from typing import Any, Sequence, Optional, Dict, List, Tuple
+
 import numpy as np
 import pandas as pd
 
-from rpy2.robjects import default_converter, pandas2ri, numpy2ri
-from rpy2.robjects.conversion import localconverter
 import rpy2.robjects as ro
+from rpy2.robjects import pandas2ri
+from rpy2.robjects.conversion import localconverter
+from rpy2.robjects.vectors import FloatVector
 from rpy2.robjects.packages import importr
-from rpy2.robjects.vectors import StrVector
-from rpy2.robjects import Formula
-
-# R pkgs
-base = importr("base")
-stats = importr("stats")
-fixest = importr("fixest")
-fwcb = importr("fwildclusterboot")
-
-_SAFE_RE = re.compile(r"[^A-Za-z0-9_]")
 
 
-def _sanitize(name: str) -> str:
-    s = _SAFE_RE.sub("_", str(name))
-    if not s or s[0].isdigit():
-        s = "v_" + s
-    s = re.sub(r"_+", "_", s).strip("_")
-    return s or "v"
+# ---------------------------------------------------------------------
+# Small utilities
+# ---------------------------------------------------------------------
+
+def set_r_seeds(seed: Optional[int]) -> None:
+    """Set both base R and dqrng seeds when available."""
+    if seed is None:
+        return
+    s = int(seed)
+    try:
+        ro.r(f"set.seed({s})")
+    except Exception:
+        pass
+    try:
+        ro.r("if (requireNamespace('dqrng', quietly=TRUE)) "
+             "dqrng::dqset.seed(%d)" % s)
+    except Exception:
+        pass
 
 
-def _make_name_map(cols: Sequence[str]) -> Dict[str, str]:
-    out: Dict[str, str] = {}
-    used: set[str] = set()
-    for c in cols:
-        s = _sanitize(c)
-        base_s = s; k = 1
-        while s in used:
-            k += 1; s = f"{base_s}_{k}"
-        used.add(s)
-        out[c] = s
+def _sanitize_varlist(df: pd.DataFrame, items: Sequence[str] | None) -> List[str]:
+    """Return only those names that are *column names* of df."""
+    cols = set(df.columns)
+    out: List[str] = []
+    for it in (items or []):
+        if isinstance(it, pd.Series):
+            nm = str(it.name) if it.name is not None else ""
+        else:
+            nm = str(getattr(it, "name", it) or "").strip()
+        if not nm:
+            continue
+        # IMPORTANT: do NOT split on '+' – we only want bare column names
+        if nm in cols and nm not in out:
+            out.append(nm)
     return out
 
 
-def _apply_name_map(df: pd.DataFrame, name_map: Dict[str, str]) -> pd.DataFrame:
-    renamer = {c: name_map[c] for c in df.columns if c in name_map}
-    return df.rename(columns=renamer)
+def _sanitize_fe_list(df: pd.DataFrame, items: Sequence[str] | None) -> List[str]:
+    """Fixed-effect arguments must be valid column names present in df."""
+    cols = set(df.columns)
+    out: List[str] = []
+    for it in (items or []):
+        nm = str(it).strip()
+        if nm and nm in cols and nm not in out:
+            out.append(nm)
+    return out
 
 
-def _map_list(names: Sequence[str], name_map: Dict[str, str]) -> List[str]:
-    return [name_map.get(n, _sanitize(n)) for n in names]
+def build_fixest_formula(outcome: str,
+                         regressors: Sequence[str] | None,
+                         fe: Sequence[str] | None) -> str:
+    """Construct a fixest formula of the form: outcome ~ x1 + x2 | fe1 + fe2"""
+    rhs = " + ".join(map(str, regressors)) if regressors else "1"
+    fe_rhs = " + ".join(map(str, fe)) if fe else ""
+    fe_part = f" | {fe_rhs}" if fe_rhs else ""
+    return f"{outcome} ~ {rhs}{fe_part}"
 
 
-def py_df_to_r(df: pd.DataFrame):
-    if not isinstance(df, pd.DataFrame):
-        raise TypeError("py_df_to_r expects a pandas DataFrame")
-    with localconverter(default_converter + pandas2ri.converter):
-        return ro.conversion.py2rpy(df)
+# ---------------------------------------------------------------------
+# fixest fit factory (shared by WCB callers)
+# ---------------------------------------------------------------------
 
+def make_feols_in_r(df: pd.DataFrame,
+                    outcome: str,
+                    regressors: Sequence[str] | None,
+                    fe: Sequence[str] | None):
+    """Fit fixest::feols in R on a sanitized sub-dataframe.
 
-def to_r_ready_df(
-    df: pd.DataFrame,
-    *,
-    needed_cols: Optional[Sequence[str]] = None,
-    year_col: Optional[str] = None,
-    cluster_col: Optional[str] = None,
-    drop_problematic: bool = True,
-) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    We keep the sub-dataframe in Python so that clustid lookups are
+    well-defined (but boottest() itself only needs the fitted object).
     """
-    Sanitize a pandas DataFrame and return (clean_df, name_map).
-    - Subset to needed_cols if provided.
-    - Drop Interval/NA-heavy columns (notably 'dose_bin').
-    - Ensure trbin_* columns are numeric (float).
-    - Coerce booleans to ints.
-    - Sanitize column names for R and return the mapping.
-    """
-    out = df.copy()
+    fixest = importr("fixest")
 
-    if needed_cols:
-        keep = [c for c in needed_cols if c in out.columns]
-        out = out.loc[:, keep].copy()
+    used_reg = _sanitize_varlist(df, regressors)
+    used_fe = _sanitize_fe_list(df, fe)
 
-    if drop_problematic:
-        for c in list(out.columns):
-            if str(out[c].dtype).startswith("interval") or c == "dose_bin":
-                out = out.drop(columns=[c])
+    keep_cols = [c for c in {outcome, *used_reg, *used_fe} if c in df.columns]
+    sub = df.loc[:, keep_cols].copy()
 
-    for cname in ("dose_bin_label", "dose_bin_str"):
-        if cname in out.columns:
-            out[cname] = out[cname].astype("string")
+    # Make sure regressors are numeric where that is appropriate
+    for c in used_reg:
+        if c in sub.columns and not np.issubdtype(sub[c].dtype, np.number):
+            sub[c] = pd.to_numeric(sub[c], errors="coerce")
 
-    for c in out.columns:
-        if c.startswith("trbin_"):
-            out[c] = pd.to_numeric(out[c], errors="coerce").astype(float)
-        if out[c].dtype == "bool":
-            out[c] = out[c].astype("int64")
+    # Fixed-effects and clustering variables should be treated as
+    # *coded* factors in R. fwildclusterboot sometimes constructs
+    # expressions like `cluster1 + cluster2` internally; if these
+    # are characters this yields `non-numeric argument to binary
+    # operator`. We therefore coerce non-numeric FE columns to
+    # integer codes (via pandas categorical), which map one-to-one
+    # to levels but are safe to add.
+    for c in used_fe:
+        if c in sub.columns and not np.issubdtype(sub[c].dtype, np.number):
+            sub[c] = sub[c].astype("category").cat.codes
 
-    name_map = _make_name_map(list(out.columns))
-    out = _apply_name_map(out, name_map)
-    return out, name_map
+    fml_str = build_fixest_formula(outcome, used_reg, used_fe)
 
+    with localconverter(pandas2ri.converter):
+        r_df = ro.conversion.py2rpy(sub)
 
-def _clust_formula(cluster: Optional[str]):
-    if cluster is None or str(cluster).strip() == "":
-        return ro.NULL
-    return Formula("~ " + str(cluster))
-
-
-def _fit_feols(df: pd.DataFrame, y: str, X: Sequence[str], FE: Sequence[str], seed: Optional[int] = None):
-    if seed is not None:
-        base.set_seed(int(seed))
-        try:
-            dqrng = importr("dqrng")
-            dqrng.dqset_seed(int(seed))
-        except Exception:
-            pass
-
-    y_f = str(y)
-    X_f = " + ".join(X) if X else "1"
-    FE_f = " + ".join(FE)
-    fml = Formula(f"{y_f} ~ {X_f}" + (f" | {FE_f}" if FE_f else ""))
-    r_df = py_df_to_r(df)
+    fml = ro.r(f"as.formula('{fml_str}')")
     fit = fixest.feols(fml, data=r_df)
-    return fit
+    return fit, sub, fml_str
 
 
-def _boottest_single(fit, param: str, clustid, B: int, weights: str, impose_null: bool, seed: Optional[int] = None) -> float:
-    args = {"param": StrVector([param]), "B": int(B), "weights": str(weights)}
-    if clustid is not None:
-        args["clustid"] = clustid
-    if impose_null:
-        args["R"] = ro.NULL; args["r"] = ro.NULL
-    if seed is not None:
-        base.set_seed(int(seed))
-        try:
-            dqrng = importr("dqrng")
-            dqrng.dqset_seed(int(seed))
-        except Exception:
-            pass
-    res = fwcb.mboottest(fit, **args)
-    p = None
-    for key in ("p_val", "p.value", "p"):
-        try:
-            v = np.array(res.rx2(key))
-            if v.size and np.isfinite(v[0]):
-                p = float(v[0]); break
-        except Exception:
-            pass
-    return float("nan") if p is None else float(p)
+
+# ---------------------------------------------------------------------
+# fwildclusterboot wrappers (boottest / mboottest for fixest)
+# ---------------------------------------------------------------------
+
+def _probe_boottest_formals(fn_name: str) -> List[str]:
+    """Return the list of formal argument names for fwildclusterboot::<fn_name>.
+
+    We only care about whether 'clustid' and 'type' exist (they do in
+    fwildclusterboot >= 0.13).
+    """
+    try:
+        return list(ro.r(f"names(formals(fwildclusterboot::{fn_name}))"))
+    except Exception:
+        return []
 
 
-def _boottest_joint_zero(fit, params: Sequence[str], clustid, B: int, weights: str, impose_null: bool, seed: Optional[int] = None) -> float:
-    args = {"param": StrVector(list(params)), "B": int(B), "weights": str(weights)}
-    if clustid is not None:
-        args["clustid"] = clustid
-    if not impose_null:
-        args["R"] = ro.NULL; args["r"] = ro.NULL
-    if seed is not None:
-        base.set_seed(int(seed))
-        try:
-            dqrng = importr("dqrng")
-            dqrng.dqset_seed(int(seed))
-        except Exception:
-            pass
-    res = fwcb.mboottest(fit, **args)
-    p = None
-    for key in ("p_val", "p.value", "p"):
-        try:
-            v = np.array(res.rx2(key))
-            if v.size and np.isfinite(v[0]):
-                p = float(v[0]); break
-        except Exception:
-            pass
-    return float("nan") if p is None else float(p)
+def _sanitize_clustid_names(df: pd.DataFrame,
+                            clustid: Sequence[str] | None) -> List[str]:
+    """Return a list of *column names* to be used as clustid.
+
+    We do **not** pass actual cluster values here – only the *names*,
+    which fwildclusterboot will look up in the model's data.
+    """
+    if not clustid:
+        return []
+    cols = set(df.columns)
+    out: List[str] = []
+    for c in clustid:
+        if isinstance(c, pd.Series):
+            nm = c.name
+        else:
+            nm = str(c).strip()
+        if nm and nm in cols and nm not in out:
+            out.append(nm)
+    return out
 
 
-def wcb_att_pvalue_r(
+def boottest_fixest(*,
+                    fit,
+                    df: pd.DataFrame,
+                    param: str,
+                    B: int,
+                    clustid: Sequence[str] | None,
+                    type_: str,
+                    impose_null: bool,
+                    seed: Optional[int]):
+    """Call fwildclusterboot::boottest() for a fixest object.
+
+    Tailored for fwildclusterboot 0.14.3:
+      boottest(fixest_fit, param = 'x', B = 9999,
+               clustid = 'cluster_col', type = 'rademacher', ...)
+    """
+    fwb = importr("fwildclusterboot")
+    set_r_seeds(seed)
+
+    formal_names = set(_probe_boottest_formals("boottest"))
+
+    # Build basic argument dict; 'object' is the S3 dispatch object
+    args = dict(
+        param=str(param),
+        B=int(B),
+        impose_null=bool(impose_null),
+    )
+
+    if "type" in formal_names:
+        args["type"] = str(type_)
+
+    cl_names = _sanitize_clustid_names(df, clustid)
+    if cl_names:
+        if len(cl_names) == 1:
+            cl_arg = cl_names[0]
+        else:
+            # multi-way clustering: character vector of names
+            cl_arg = ro.StrVector(cl_names)
+
+        if "clustid" in formal_names:
+            args["clustid"] = cl_arg
+
+    # First attempt with detected arguments
+    try:
+        return fwb.boottest(fit, **args)
+    except Exception:
+        # Retry without 'type' if that caused trouble
+        args_retry = {k: v for k, v in args.items() if k != "type"}
+        return fwb.boottest(fit, **args_retry)
+
+def _probe_boottest_names(fn_name: str) -> set:
+    fwb = importr("fwildclusterboot")
+    f = getattr(fwb, fn_name)
+    try:
+        formals = list(ro.r("function(f) names(formals(f))")(f))
+        return set(map(str, formals))
+    except Exception:
+        # conservative default
+        return {"B","weights","type","clustid","cluster","impose_null","R","r","param"}
+
+
+def mboottest_fixest(
     df: pd.DataFrame,
-    *,
-    outcome: str,
-    regressors: Sequence[str],
-    fe: Sequence[str],
-    cluster: Optional[str],
-    param: str,
-    B: int = 9999,
-    weights: str = "webb",
-    impose_null: bool = True,
-    seed: Optional[int] = None,
-) -> float:
-    needed = [outcome] + list(regressors) + list(fe) + ([cluster] if cluster else [])
-    clean_df, name_map = to_r_ready_df(df, needed_cols=needed, year_col=(fe[0] if fe else None), cluster_col=cluster)
-    y_s   = name_map.get(outcome, _sanitize(outcome))
-    X_s   = [name_map.get(x, _sanitize(x)) for x in regressors]
-    FE_s  = [name_map.get(f, _sanitize(f)) for f in fe]
-    clu_s = name_map.get(cluster, cluster) if cluster else None
-    par_s = name_map.get(param, _sanitize(param))
-    fit = _fit_feols(clean_df, y_s, X_s, FE_s, seed)
-    clustid = _clust_formula(clu_s)
-    return _boottest_single(fit, param=par_s, clustid=clustid, B=B, weights=weights, impose_null=impose_null, seed=seed)
-
-
-def wcb_joint_pvalue_r(
-    df: pd.DataFrame,
-    *,
-    outcome: str,
-    regressors: Sequence[str],
-    fe: Sequence[str],
-    cluster: Optional[str],
-    joint_zero: Sequence[str],
-    B: int = 9999,
-    weights: str = "webb",
-    impose_null: bool = True,
-    seed: Optional[int] = None,
-) -> float:
-    needed = [outcome] + list(regressors) + list(fe) + ([cluster] if cluster else [])
-    clean_df, name_map = to_r_ready_df(df, needed_cols=needed, year_col=(fe[0] if fe else None), cluster_col=cluster)
-    y_s   = name_map.get(outcome, _sanitize(outcome))
-    X_s   = [name_map.get(x, _sanitize(x)) for x in regressors]
-    FE_s  = [name_map.get(f, _sanitize(f)) for f in fe]
-    clu_s = name_map.get(cluster, cluster) if cluster else None
-
-    fit = _fit_feols(clean_df, y_s, X_s, FE_s, seed)
-    clustid = _clust_formula(clu_s)
-    params = [name_map.get(p, _sanitize(p)) for p in joint_zero]
-    return _boottest_joint_zero(fit, params=params, clustid=clustid, B=B, weights=weights, impose_null=impose_null, seed=seed)
-
-
-def wcb_equal_bins_pvalue_r(
-    df: pd.DataFrame,
-    *,
-    outcome: str,
-    regressors: Sequence[str],
-    fe: Sequence[str],
-    cluster: Optional[str],
-    bin_params: Sequence[str],
-    B: int = 9999,
-    weights: str = "webb",
-    impose_null: bool = True,
-    seed: Optional[int] = None,
+    fit: ro.Environment,                  # kept for API compatibility, unused
+    joint_params: Optional[Sequence[str]],     # names of coefficients to test jointly
+    B: int,
+    impose_null: bool,
+    clustid: Optional[Sequence[str]],
+    type_: str,
 ) -> float:
     """
-    Test H0: all bin effects are equal by reparameterising as differences
-    against the first bin column in bin_params.
+    Wrapper around fwildclusterboot::mboottest for a fixest (feols) object
+    using the Julia backend (WildBootTests.jl).
+
+    We follow the fwildclusterboot examples and use
+    clubSandwich::constrain_zero() to construct the restriction matrix R
+    for H0: R * beta = 0, where each row sets one coefficient in
+    `joint_params` to zero.
+
+    This avoids hand-rolling R and prevents the Julia error:
+
+        "Null hypothesis or model constraints are inconsistent or redundant."
+
+    Parameters
+    ----------
+    df : DataFrame
+        Data used to fit the fixest model (subsample).
+    fit : R object
+        fixest::feols fitted model.
+    param : str or None
+        Unused here; present for signature compatibility.
+    joint_params : list[str] or None
+        Names of coefficients to test jointly equal to zero.
+    B : int
+        Number of bootstrap replications.
+    impose_null : bool
+        Whether to impose the null in the bootstrap DGP.
+    clustid : list[str] or None
+        Names of cluster variables (columns in df).
+    type_ : str
+        Bootstrap weight type (e.g. "rademacher").
+
+    Returns
+    -------
+    float
+        Wild cluster bootstrap p-value for H0: all `joint_params` = 0,
+        or NaN on failure.
     """
-    if not bin_params:
+    if not joint_params:
+        # Nothing to test
         return float("nan")
-    ref = bin_params[0]
 
-    g = df.copy()
-    for b in bin_params[1:]:
-        g[f"diff__{b}__{ref}"] = g[b] - g[ref]
+    # Import R packages
+    fwb = importr("fwildclusterboot")
+    try:
+        club = importr("clubSandwich")
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(
+            "R package 'clubSandwich' is required for joint WCB tests "
+            "(mboottest_fixest). Please install it in R via "
+            "`install.packages('clubSandwich')`."
+        ) from e
 
-    diff_cols = [f"diff__{b}__{ref}" for b in bin_params[1:]]
+    # 1) Map coefficient NAMES -> POSITIONS
+    coef_vec = ro.r["coef"](fit)
+    coef_names = [str(n) for n in coef_vec.names]
 
-    needed = [outcome] + list(regressors) + list(fe) + ([cluster] if cluster else []) + diff_cols
-    clean_df, name_map = to_r_ready_df(g, needed_cols=needed, year_col=(fe[0] if fe else None), cluster_col=cluster)
-    y_s   = name_map.get(outcome, _sanitize(outcome))
-    X_base = [c for c in regressors if c not in bin_params]
-    X_trans = [name_map.get(x, _sanitize(x)) for x in X_base] + [name_map[c] for c in diff_cols]
-    FE_s  = [name_map.get(f, _sanitize(f)) for f in fe]
-    clu_s = name_map.get(cluster, cluster) if cluster else None
+    idx = []
+    for name in joint_params:
+        try:
+            j = coef_names.index(str(name))
+        except ValueError as exc:
+            raise ValueError(
+                f"[mboottest_fixest] Coefficient '{name}' not found in fixest "
+                f"coefficients: {coef_names}"
+            ) from exc
+        # R is 1-based
+        idx.append(j + 1)
 
-    fit = _fit_feols(clean_df, y_s, X_trans, FE_s, seed)
-    clustid = _clust_formula(clu_s)
-    return _boottest_joint_zero(fit, params=[name_map[c] for c in diff_cols], clustid=clustid,
-                                B=B, weights=weights, impose_null=impose_null, seed=seed)
+    # 2) Let clubSandwich build a consistent R matrix:
+    #    R <- clubSandwich::constrain_zero(idx, coef(fit))
+    idx_vec = ro.IntVector(idx)
+    R_mat = club.constrain_zero(idx_vec, coef_vec)
+
+    # 3) Build clustid argument from df column names
+    cl_names = _sanitize_clustid_names(df, clustid or [])
+    if not cl_names:
+        raise ValueError(
+            "[mboottest_fixest] No valid cluster variable found. "
+            f"Requested clustid={clustid}, df columns={list(df.columns)}"
+        )
+    if len(cl_names) == 1:
+        cl_arg = cl_names[0]
+    else:
+        cl_arg = ro.StrVector(cl_names)
+
+    # 4) Assemble mboottest arguments
+    args: Dict[str, Any] = {
+        "object": fit,
+        "clustid": cl_arg,
+        "B": int(B),
+        "R": R_mat,
+        "impose_null": bool(impose_null),
+        "type": str(type_),
+    }
+
+    # NOTE: we let fwildclusterboot / WildBootTests.jl choose engine.
+    # If you want to force Julia explicitly, you *can* add:
+    #   args["engine"] = "WildBootTests.jl"
+    # but it's usually not necessary.
+
+    # 5) Call mboottest
+    try:
+        res = fwb.mboottest(**args)
+    except ro.RRuntimeError as e:
+        # If we hit "unused argument" errors for old versions, try stripping
+        # type/clustid once and re-running.
+        msg = str(e)
+        if "unused argument" in msg:
+            for bad in ("type", "weights", "clustid", "cluster"):
+                args.pop(bad, None)
+            res = fwb.mboottest(**args)
+        else:
+            raise
+
+    # 6) Extract p-value via pval() S3 method
+    try:
+        p_fun = ro.r("pval")
+        p_vec = p_fun(res)
+        return float(p_vec[0])
+    except Exception:
+        # Fallback: try common slots
+        for slot in ("p_val", "p.value", "pval", "p"):
+            try:
+                val = res.rx2(slot)
+                if val is not None:
+                    return float(val[0])
+            except Exception:
+                continue
+
+    return float("nan")
