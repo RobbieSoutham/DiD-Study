@@ -29,6 +29,17 @@ def _fmt_p(p: Optional[float]) -> str:
         return "NA"
     return f"{p:.3f}" if p >= 0.001 else "<0.001"
 
+def _fmt_vif(val: Any) -> str:
+    try:
+        fval = float(val)
+    except Exception:
+        return "NA"
+    if np.isnan(fval):
+        return "NA"
+    if np.isinf(fval):
+        return "inf" if fval > 0 else "-inf"
+    return f"{fval:.2f}"
+
 def _fmt_p_with_stars(p: Optional[float]) -> str:
     """Format p-value with asterisks for significance."""
     if p is None or (isinstance(p, float) and (np.isnan(p) or np.isinf(p))):
@@ -152,6 +163,88 @@ def _bins_result_to_df(bin_result: Any) -> pd.DataFrame:
 
     return pd.DataFrame(rows)
 
+
+def _safe_int(value: Any) -> Optional[int]:
+    """Try to coerce a scalar into an integer window length, else None."""
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _print_event_study_support(
+    panel_df: Optional[pd.DataFrame],
+    panel_info: Optional[Dict[str, Any]],
+) -> None:
+    if panel_df is None or panel_df.empty:
+        return
+    cols = set(panel_df.columns)
+    if not {"event_time", "post"}.issubset(cols):
+        return
+
+    pre_window = _safe_int((panel_info or {}).get("pre"))
+    post_window = _safe_int((panel_info or {}).get("post"))
+
+    df = panel_df.copy()
+    mask = df["event_time"].notna()
+    if "g" in cols:
+        mask &= df["g"].notna()
+
+    if pre_window is not None:
+        mask &= df["event_time"] >= -pre_window
+    if post_window is not None:
+        mask &= df["event_time"] <= post_window
+
+    if mask.sum() == 0:
+        return
+
+    df_window = df.loc[mask].copy()
+    pre_mask = df_window["event_time"] < 0
+    post_mask = df_window["event_time"] >= 0
+
+    def _nunique(series: pd.Series) -> int:
+        return int(series.nunique()) if not series.empty else 0
+
+    pre_units = _nunique(df_window.loc[pre_mask, "unit_id"]) if "unit_id" in cols else None
+    post_units = _nunique(df_window.loc[post_mask, "unit_id"]) if "unit_id" in cols else None
+
+    pre_range = f"[-{pre_window}..-1]" if pre_window is not None else "<0"
+    post_range = f"[0..{post_window}]" if post_window is not None else ">=0"
+
+    print("\nEvent-study support (pooled):")
+    print(f"  Pre rows {pre_range}: {int(pre_mask.sum())} (units {pre_units if pre_units is not None else 'NA'})")
+    print(f"  Post rows {post_range}: {int(post_mask.sum())} (units {post_units if post_units is not None else 'NA'})")
+
+    if "dose_bin" not in cols:
+        return
+
+    bin_candidates = panel_df.loc[(panel_df["post"] == 1) & panel_df["dose_bin"].notna()]
+    if bin_candidates.empty:
+        return
+
+    bin_map = (
+        bin_candidates.sort_values(["unit_id"])
+        .drop_duplicates("unit_id", keep="first")
+        .set_index("unit_id")["dose_bin"]
+        .dropna()
+    )
+    if bin_map.empty:
+        return
+
+    bins_df = df_window.copy()
+    bins_df["_bin_label"] = bins_df["unit_id"].map(bin_map)
+    bins_df = bins_df[bins_df["_bin_label"].notna()]
+    if bins_df.empty:
+        return
+
+    print("  Support by bin:")
+    for label in sorted(bins_df["_bin_label"].unique(), key=lambda x: str(x)):
+        subset = bins_df[bins_df["_bin_label"] == label]
+        pre_bin = int((subset["event_time"] < 0).sum())
+        post_bin = int((subset["event_time"] >= 0).sum())
+        units_bin = int((bin_map == label).sum())
+        print(f"    - {label}: pre rows={pre_bin}, post rows={post_bin}, units={units_bin}")
+
 # ================================
 # Main printable carrier
 # ================================
@@ -217,6 +310,20 @@ def print_panel_block(info: Dict[str, Any]) -> None:
         print("[Bin support] units/rows per bin:")
         for b, s in support.items():
             print(f"  - {b}: units={s.get('units', 'NA')} rows={s.get('rows', 'NA')}")
+
+    vif = info.get("covariate_vif")
+    if vif:
+        print("Covariate VIFs:")
+        sorted_vif = sorted(
+            vif.items(),
+            key=lambda item: (
+                not np.isfinite(item[1]),
+                -float(item[1]) if np.isfinite(item[1]) else 0.0,
+                item[0],
+            )
+        )
+        for col, value in sorted_vif:
+            print(f"  - {col}: {_fmt_vif(value)}")
 
     # Quick histogram if dose_series present
     dose_series = info.get("dose_series")
@@ -355,6 +462,7 @@ def print_es_block(
             )
         except Exception as e:
             print(f"[plot warning] could not plot mean dose by tau: {e}")
+    _print_event_study_support(panel_df, panel_info)
 
 def print_honestdid_block(hd: Optional[Dict[str, Any]]) -> None:
     _rule("HonestDiD")

@@ -1,3 +1,6 @@
+# did_study/study.py
+# COMPLETE VERSION - November 14, 2025
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -16,7 +19,6 @@ from .helpers.utils import choose_wcb_weights_and_B
 @dataclass
 class DidStudyResult:
     """Container for all outputs of a DidStudy run."""
-
     config: StudyConfig
     data: PanelData
 
@@ -43,33 +45,19 @@ def _tau_from_es_name(col: str) -> Optional[int]:
 
 
 class DidStudy:
-    """
-    High-level orchestration class for a DiD study.
-
-    This class:
-      1. Takes a StudyConfig.
-      2. Prepares the panel data (constructs treatment indicators, bins, event-time dummies).
-      3. Runs the requested estimators (ATT^o, dose-response bins, event study).
-      4. Optionally runs robustness procedures (HonestDiD, WCB).
-    """
+    """Orchestrates the full DiD analysis pipeline."""
 
     def __init__(self, config: StudyConfig) -> None:
         self.config = config
         self._estimator: Optional[DidEstimator] = None
         self._panel: Optional[PanelData] = None
 
-    # ------------------------------------------------------------------
-    # Properties
-    # ------------------------------------------------------------------
     @property
     def estimator(self) -> DidEstimator:
         if self._estimator is None:
             raise RuntimeError("Estimator not initialised yet. Call .run().")
         return self._estimator
 
-    # ------------------------------------------------------------------
-    # Main pipeline
-    # ------------------------------------------------------------------
     def run(
         self,
         *,
@@ -80,12 +68,29 @@ class DidStudy:
     ) -> DidStudyResult:
         """
         Run the full DiD study pipeline.
+
+        Parameters
+        ----------
+        run_att : bool
+            If True, estimate pooled ATT^o.
+        run_bins : bool
+            If True, estimate dose-bin heterogeneous effects.
+        run_event_study : bool
+            If True, estimate event-study coefficients with leads/lags.
+        run_honest_did : bool
+            If True, run HonestDiD sensitivity analysis.
+
+        Returns
+        -------
+        DidStudyResult
+            Container with all estimates and robustness checks.
         """
+
         # 1) Prepare panel
         panel = PanelData(self.config)
         self._panel = panel
-
         df = panel.panel
+
         if df is not None and "dose_level" in df.columns:
             info = getattr(panel, "info", {})
             if isinstance(info, dict) and "dose_series" not in info:
@@ -94,11 +99,13 @@ class DidStudy:
         # 2) Choose WCB config once
         G_total = int(df["unit_id"].nunique())
         G_treated = int(df.loc[df["treated_ever"] == 1, "unit_id"].nunique())
+
         wcb_weights_auto, wcb_B = choose_wcb_weights_and_B(
             G_total=G_total,
             G_treated=G_treated,
             B_requested=self.config.wcb_B,
         )
+
         weights_pref = getattr(self.config, "wcb_weights", "auto")
         wcb_weights = wcb_weights_auto if weights_pref == "auto" else weights_pref
 
@@ -143,6 +150,7 @@ class DidStudy:
         # 6) Event study
         if run_event_study:
             result.event_study = self.estimator.event_study(panel=panel, wcb_args=wcb_args)
+
             if result.event_study is not None:
                 result.es_wcb_p = getattr(result.event_study, "wcb_p", None)
 
@@ -154,12 +162,11 @@ class DidStudy:
         # 8) Meta
         if result.es_wcb_p is not None:
             wcb_meta["es_wcb_p"] = result.es_wcb_p
+
         result.wcb_meta = wcb_meta
+
         return result
 
-    # ------------------------------------------------------------------
-    # HonestDiD (Δ^RM, Rambachan & Roth 2023)
-    # ------------------------------------------------------------------
     def _run_honest_did(
         self,
         panel: PanelData,
@@ -168,75 +175,110 @@ class DidStudy:
         """
         Compute Rambachan & Roth (2023) Δ^RM bounds for a scalar parameter θ.
 
-        θ is defined as a *linear functional* of the post-treatment event-study
-        coefficients:
-
-            θ = l_vec' * τ_post
+        θ = l_vec' * τ_post
 
         where τ_post is the vector of post-treatment event-time effects and
-        l_vec are weights. We choose l_vec proportional to the number of
-        treated observations in each post-event horizon (i.e. an exposure-
-        weighted average ATT^O), falling back to uniform weights if needed.
-
-        This θ is then passed as `l_vec` to HonestDiD's
-        createSensitivityResults_relativeMagnitudes() so that the naive
-        estimate θ_hat and the HonestDiD robust bounds refer to the *same*
-        estimand.
+        l_vec are exposure-weighted or uniform weights.
         """
+
         es = result.event_study
         if es is None or es.coefs is None or es.coefs.empty:
+            print("[HonestDiD] Event study results not available")
             return {}
 
+        # Extract pre and post names
         names_pre = list(getattr(es, "names_pre", []) or [])
         names_post = list(getattr(es, "names_post", []) or [])
+
         if not names_pre or not names_post:
+            print(f"[HonestDiD] Insufficient pre ({len(names_pre)}) or post ({len(names_post)}) periods")
             return {}
 
-        ordered_names = names_pre + names_post
+        # Extract the full covariance matrix
+        vcov = getattr(es, "vcov", None)
+        if vcov is None or vcov.size == 0:
+            print("[HonestDiD] No vcov matrix available from event study")
+            return {}
 
-        # Event-study coefficient table (from estimator.event_study)
-        coef_tab = es.coefs  # columns typically: ['event_time', 'beta', 'se', ...]
+        # =====================================================================
+        # Extract betas in the correct [pre, post] order
+        # =====================================================================
+        coef_tab = es.coefs  # DataFrame with columns: event_time, beta, se, p
 
-        def beta_for(name: str) -> Optional[float]:
-            tau = _tau_from_es_name(name)
-            if tau is None:
-                return None
+        def tau_from_name(name: str) -> Optional[int]:
+            """Parse ES_t*/ES_tm* names to event times."""
+            if name.startswith("ES_tm"):
+                return -int(name.replace("ES_tm", ""))
+            if name.startswith("ES_t"):
+                return int(name.replace("ES_t", ""))
+            return None
+
+        # Get event times for pre and post
+        pre_taus = [tau_from_name(n) for n in names_pre]
+        post_taus = [tau_from_name(n) for n in names_post]
+
+        if any(t is None for t in pre_taus + post_taus):
+            print("[HonestDiD] Could not parse all event-time names")
+            return {}
+
+        # Extract beta for each event time
+        def beta_for_tau(tau: int) -> Optional[float]:
             row = coef_tab.loc[coef_tab["event_time"] == tau]
             return None if row.empty else float(row.iloc[0]["beta"])
 
-        betas = [beta_for(n) for n in ordered_names]
-        if any(v is None for v in betas):
-            # Incomplete mapping from ES_* names back to event_time
-            return {}
-        beta_s = pd.Series(betas, index=ordered_names, dtype=float)
+        pre_betas = [beta_for_tau(t) for t in pre_taus]
+        post_betas = [beta_for_tau(t) for t in post_taus]
 
-        # Pre/post event times as integers
-        pre_periods = [_tau_from_es_name(n) for n in names_pre]
-        post_periods = [_tau_from_es_name(n) for n in names_post]
-        if not pre_periods or not post_periods or any(
-            x is None for x in pre_periods + post_periods
-        ):
+        if any(b is None for b in pre_betas + post_betas):
+            print("[HonestDiD] Missing beta values for some event times")
             return {}
 
-        # ------------------------------------------------------------------
-        # Construct l_vec (weights over post-treatment horizons)
-        # ------------------------------------------------------------------
+        betas = np.array(pre_betas + post_betas, dtype=float)
+
+        # Validate vcov dimensions match betas
+        expected_len = len(pre_taus) + len(post_taus)
+        if vcov.shape != (expected_len, expected_len):
+            print(
+                f"[HonestDiD] vcov shape {vcov.shape} doesn't match betas length {expected_len}"
+            )
+            return {}
+
+        # =====================================================================
+        # Construct l_vec (weights over post-treatment horizons ONLY)
+        # =====================================================================
         used = getattr(es, "data", None)
         l_vec = None
+
         if used is not None and names_post:
-            # Exposure-based weights: number of treated observations contributing
-            # to each event-time dummy ES_tk in the design matrix used to fit
-            # the event study.
+            # Exposure-based weights: number of treated observations at each event time
             counts = []
             for nm in names_post:
                 counts.append(float(used[nm].sum()) if nm in used.columns else 0.0)
+
             total = float(sum(counts))
+
             if total > 0.0:
                 l_vec = np.array(counts, dtype=float) / total
+                print(f"[HonestDiD] Exposure-weighted l_vec: {l_vec}")
+            else:
+                # Fallback to uniform if no exposure data
+                l_vec = np.ones(len(names_post), dtype=float) / len(names_post)
+                print(f"[HonestDiD] No exposure data; using uniform l_vec: {l_vec}")
+        else:
+            # Fallback to uniform weights
+            l_vec = np.ones(len(names_post), dtype=float) / len(names_post)
+            print(f"[HonestDiD] Using uniform l_vec: {l_vec}")
 
-        # ------------------------------------------------------------------
+        # Validate l_vec length
+        if len(l_vec) != len(post_taus):
+            print(
+                f"[HonestDiD] l_vec length {len(l_vec)} != numPostPeriods {len(post_taus)}"
+            )
+            return {}
+
+        # =====================================================================
         # Mbar grid configuration
-        # ------------------------------------------------------------------
+        # =====================================================================
         M_grid_cfg = getattr(self.config, "honestdid_M_grid", None)
         if M_grid_cfg:
             grid_sorted = sorted(float(x) for x in M_grid_cfg if x is not None)
@@ -249,20 +291,19 @@ class DidStudy:
         else:
             grid_points = 10
             Mmax = getattr(self.config, "honestdid_Mbar", None)
+
         if Mmax is None:
-            # Default upper bound for Δ^RM grid; substantive choice
             Mmax = 2.0
 
-        # ------------------------------------------------------------------
+        # =====================================================================
         # Call HonestDiD (Δ^RM, method C-LF) via R
-        # ------------------------------------------------------------------
+        # =====================================================================
         try:
             res = honest_did_bounds(
-                es_df=coef_tab,
-                pre_periods=pre_periods,
-                post_periods=post_periods,
-                beta_col="beta",
-                se_col="se",
+                betas=betas,
+                Sigma=vcov,  # Full covariance from event study
+                numPrePeriods=len(pre_taus),
+                numPostPeriods=len(post_taus),
                 Mmax=Mmax,
                 grid_points=int(grid_points),
                 seed=getattr(self.config, "seed", None),
@@ -270,29 +311,29 @@ class DidStudy:
             )
         except Exception as e:
             print(f"[HonestDiD] failed: {e}")
+            import traceback
+            traceback.print_exc()
             return {}
 
-        # ------------------------------------------------------------------
+        # =====================================================================
         # Build output: M-grid, bounds, and naive θ̂
-        # ------------------------------------------------------------------
+        # =====================================================================
         M = np.array(res.M, dtype=float)
         lo = np.array(res.lb, dtype=float)
         hi = np.array(res.ub, dtype=float)
 
         # Naive θ̂ computed from the same l_vec used in HonestDiD
-        post_betas = np.array(
-            [beta_s.get(n, np.nan) for n in names_post if n in beta_s.index],
-            dtype=float,
-        )
-        if post_betas.size == 0:
-            return {}
+        post_betas_arr = np.array(post_betas, dtype=float)
+        theta_hat = float(np.dot(post_betas_arr, l_vec))
 
-        if l_vec is None or len(l_vec) != post_betas.size:
-            # Fallback: uniform weighting over post periods
-            weights = np.ones(post_betas.size, dtype=float) / post_betas.size
-        else:
-            weights = l_vec[:post_betas.size]
-
-        theta_hat = float(np.dot(post_betas, weights))
-
-        return {"M": M, "lo": lo, "hi": hi, "theta_hat": theta_hat}
+        return {
+            "M": M,
+            "lo": lo,
+            "hi": hi,
+            "theta_hat": theta_hat,
+            "l_vec": l_vec,
+            "numPrePeriods": len(pre_taus),
+            "numPostPeriods": len(post_taus),
+            "method": res.method,
+            "delta_label": res.delta_label,
+        }

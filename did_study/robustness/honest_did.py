@@ -1,9 +1,10 @@
 # did_study/robustness/honest_did.py
+# COMPLETE VERSION - November 14, 2025
+
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Sequence
-from types import SimpleNamespace
+from typing import Any, Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -17,12 +18,11 @@ from did_study.robustness.r_interface import set_r_seeds
 @dataclass
 class HonestDiDResult:
     """Container for HonestDiD relative-magnitude bounds on a scalar θ."""
-
-    M: np.ndarray          # grid of Mbar values
-    lb: np.ndarray         # lower bounds
-    ub: np.ndarray         # upper bounds
-    method: str            # e.g. "C-LF"
-    delta_label: str       # e.g. "DeltaRM"
+    M: np.ndarray  # grid of Mbar values
+    lb: np.ndarray  # lower bounds
+    ub: np.ndarray  # upper bounds
+    method: str  # e.g. "C-LF"
+    delta_label: str  # e.g. "DeltaRM"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -34,223 +34,164 @@ class HonestDiDResult:
         }
 
 
-def sanitize_es_for_honestdid(
-    es_df: pd.DataFrame,
-    pre_periods: Sequence[int],
-    post_periods: Sequence[int],
-    beta_col: str = "att",
-    se_col: str = "se",
-) -> SimpleNamespace:
-    """
-    Extract the event-study coefficient vector and covariance matrix in the
-    format expected by HonestDiD.
-
-    Following Rambachan & Roth (2023), we assume betahat is stacked as:
-
-        betahat = (β_pre, τ_post),
-
-    where β_pre are pre-treatment event-time coefficients and τ_post are
-    post-treatment event-time coefficients, both ordered chronologically.
-
-    Parameters
-    ----------
-    es_df : DataFrame
-        Event-study results with at least columns: 'event_time', beta_col, se_col.
-    pre_periods : sequence of int
-        Pre-treatment event times (e.g. [-5, -4, -3, -2]).
-    post_periods : sequence of int
-        Post-treatment event times (e.g. [0, 1, 2, 3, 4, 5]).
-    beta_col, se_col : str
-        Column names for the point estimates and standard errors.
-
-    Returns
-    -------
-    SimpleNamespace
-        Fields:
-          - betas: np.ndarray of length numPre + numPost
-          - Sigma: 2D np.ndarray covariance matrix
-          - numPrePeriods, numPostPeriods: ints
-          - pre_idx, post_idx: index arrays into the stacked beta vector
-    """
-    df = es_df.copy()
-
-    if "event_time" not in df.columns:
-        raise ValueError("es_df must contain an 'event_time' column for HonestDiD.")
-
-    # Ensure sorted by event_time for stable ordering: negatives first, then non-negatives
-    df = df.sort_values("event_time").reset_index(drop=True)
-
-    # Keep only the event times we designate as pre/post (drop reference periods)
-    mask = df["event_time"].isin(list(pre_periods) + list(post_periods))
-    df = df.loc[mask].copy()
-
-    if df.empty:
-        raise ValueError("No event-study rows remain after filtering to pre/post periods.")
-
-    pre_idx = np.where(df["event_time"].isin(pre_periods))[0]
-    post_idx = np.where(df["event_time"].isin(post_periods))[0]
-
-    num_pre = len(pre_idx)
-    num_post = len(post_idx)
-
-    if num_pre == 0 or num_post == 0:
-        raise ValueError(
-            f"Need at least one pre and one post period for HonestDiD; "
-            f"got numPre={num_pre}, numPost={num_post}."
-        )
-
-    # Betas vector: stacked in chronological order (pre, then post)
-    betas = df[beta_col].to_numpy(dtype=float)
-
-    # Covariance: here we approximate with diag(se^2). If you have a full
-    # covariance matrix from the event-study regression, you can plug it in
-    # here instead to match the richest implementation in the literature.
-    if se_col not in df.columns:
-        raise ValueError(
-            f"es_df must contain column '{se_col}' for HonestDiD (standard errors)."
-        )
-    ses = df[se_col].to_numpy(dtype=float)
-    Sigma = np.diag(ses ** 2)
-
-    return SimpleNamespace(
-        betas=betas,
-        Sigma=Sigma,
-        numPrePeriods=num_pre,
-        numPostPeriods=num_post,
-        pre_idx=pre_idx,
-        post_idx=post_idx,
-    )
-
-
 def honest_did_bounds(
-    es_df: pd.DataFrame,
-    pre_periods: Sequence[int],
-    post_periods: Sequence[int],
-    beta_col: str = "att",
-    se_col: str = "se",
+    betas: np.ndarray,
+    Sigma: np.ndarray,
+    numPrePeriods: int,
+    numPostPeriods: int,
     Mmax: Optional[float] = None,
     grid_points: int = 10,
     seed: Optional[int] = 123,
     l_vec: Optional[np.ndarray] = None,
 ) -> HonestDiDResult:
     """
-    Compute HonestDiD Δ^RM (“relative magnitudes”) sensitivity bounds for θ.
-
-    We call HonestDiD::createSensitivityResults_relativeMagnitudes with:
-
-        - bound = "deviation from parallel trends"  (Δ^RM)
-        - method = "C-LF"                           (Conley et al. local projections)
-        - Mbarvec = grid of Mbar in [0, Mmax]
-        - l_vec = user-specified weights for the scalar parameter
-                 θ = l_vec' * τ_post (length = numPostPeriods)
+    Compute HonestDiD Δ^RM ("relative magnitudes") sensitivity bounds for θ.
 
     Parameters
     ----------
-    es_df : DataFrame
-        Event-study table (one row per event_time).
-    pre_periods, post_periods : sequences of int
-        Pre- and post-treatment event times used in the PTA.
-    beta_col, se_col : str
-        Column names of estimates and standard errors in es_df.
+    betas : np.ndarray
+        Event-study coefficients, ordered [pre_periods, post_periods].
+        Length = numPrePeriods + numPostPeriods.
+        Example: [β_{-5}, β_{-4}, β_{-3}, β_{-2}, β_0, β_1, ..., β_8]
+
+    Sigma : np.ndarray
+        Full covariance matrix of event-study coefficients (cluster-robust).
+        Shape = (numPrePeriods + numPostPeriods, numPrePeriods + numPostPeriods).
+
+    numPrePeriods : int
+        Number of pre-treatment periods. Example: if leads are [-5, -4, -3, -2], then numPrePeriods = 4.
+
+    numPostPeriods : int
+        Number of post-treatment periods. Example: if lags are [0, 1, ..., 8], then numPostPeriods = 9.
+
     Mmax : float, optional
-        Maximum relative magnitude (Mbar) to consider. If None, defaults to 2.0.
-        This is a *substantive* choice: higher Mmax allows larger deviations
-        from parallel trends (more conservative bounds).
+        Maximum relative magnitude threshold. Default 2.0.
+        M=0: no parallel-trend violation
+        M=1: post-violation ≤ pre-violation
+        M=2: post-violation can be up to 2x pre-violation (more conservative)
+
     grid_points : int
-        Number of grid points between 0 and Mmax (inclusive).
+        Number of grid points between 0 and Mmax.
+
     seed : int, optional
-        Seed passed through to the R RNG to ensure reproducibility.
+        RNG seed for reproducibility.
+
     l_vec : np.ndarray, optional
-        Length numPostPeriods. If provided, defines θ = l_vec' * τ_post.
-        If None, HonestDiD defaults to a basis vector picking out the first
-        post-treatment period.
+        Length numPostPeriods. Weights for post-treatment effects: θ = l_vec' * τ_post.
+        If None, HonestDiD defaults to picking the first post-period.
 
     Returns
     -------
     HonestDiDResult
-        Contains arrays of M, lower and upper bounds, and metadata.
+        M, lb, ub arrays and metadata.
+
+    Raises
+    ------
+    ValueError
+        If dimensions don't match.
+    RuntimeError
+        If HonestDiD R call fails.
     """
-    # 1) Extract betas and covariance in the format HonestDiD expects
-    es = sanitize_es_for_honestdid(
-        es_df=es_df,
-        pre_periods=pre_periods,
-        post_periods=post_periods,
-        beta_col=beta_col,
-        se_col=se_col,
-    )
 
-    betas = es.betas
-    Sigma = es.Sigma
+    # Validate inputs
+    if not isinstance(betas, np.ndarray):
+        betas = np.asarray(betas, dtype=float)
+    if not isinstance(Sigma, np.ndarray):
+        Sigma = np.asarray(Sigma, dtype=float)
 
-    # 2) Choose Mmax if not provided (substantive choice, not data-driven)
+    numTotal = numPrePeriods + numPostPeriods
+
+    if betas.size != numTotal:
+        raise ValueError(
+            f"betas length {betas.size} != numPrePeriods + numPostPeriods "
+            f"({numPrePeriods} + {numPostPeriods} = {numTotal})"
+        )
+
+    expected_shape = (numTotal, numTotal)
+    if Sigma.shape != expected_shape:
+        raise ValueError(
+            f"Sigma shape {Sigma.shape} != expected {expected_shape}"
+        )
+
+    # Choose Mmax
     if Mmax is None:
         Mmax = 2.0
-    if Mmax <= 0:
-        raise ValueError(f"Mmax must be positive; got {Mmax}.")
 
-    # Grid over [0, Mmax]
-    M_grid = np.linspace(0.0, Mmax, num=grid_points)
+    if Mmax < 0:
+        raise ValueError(f"Mmax must be non-negative; got {Mmax}.")
 
-    # 3) Call HonestDiD in R
+    M_grid = np.linspace(0.0, Mmax, num=int(grid_points))
+
+    # Validate l_vec if provided
+    if l_vec is not None:
+        l_vec = np.asarray(l_vec, dtype=float)
+        # CRITICAL FIX: Check against numPostPeriods (int), not a list!
+        if l_vec.size != numPostPeriods:
+            raise ValueError(
+                f"l_vec must have length numPostPeriods={numPostPeriods}, "
+                f"got {l_vec.size}."
+            )
+        if not np.isclose(l_vec.sum(), 1.0, atol=1e-6):
+            print(f"[Warning] l_vec sums to {l_vec.sum():.6f}, not 1.0")
+
+    # Call HonestDiD in R
     HonestDiD = importr("HonestDiD")
-
-    # Synchronise RNG state for reproducibility
     set_r_seeds(seed)
 
-    # Convert to R objects
     R_beta = ro.FloatVector(betas.tolist())
     R_Sigma = ro.r["matrix"](
         ro.FloatVector(Sigma.ravel(order="C")),
         nrow=Sigma.shape[0],
     )
     R_M = ro.FloatVector(M_grid.tolist())
-
     R_l_vec = None
+
     if l_vec is not None:
-        l_vec = np.asarray(l_vec, dtype=float)
-        if l_vec.size != es.numPostPeriods:
-            raise ValueError(
-                f"l_vec must have length numPostPeriods={es.numPostPeriods}, "
-                f"got {l_vec.size}."
-            )
         R_l_vec = ro.FloatVector(l_vec.tolist())
 
-    # Optional debug logging
     print("=" * 72)
     print("[HonestDiD CALL] -> createSensitivityResults_relativeMagnitudes")
     print("=" * 72)
-    print("Parameters:")
-    print(f"  - betahat: {R_beta}")
-    print(f"  - R_Sigma: {R_Sigma}")
-    print(f"  - n_pre: {es.numPrePeriods}")
-    print(f"  - n_post: {es.numPostPeriods}")
-    print(f"  - Mbar grid: {R_M}")
+    print(f"Parameters:")
+    print(f"  - betahat length: {len(betas)}")
+    print(f"  - Sigma shape: {Sigma.shape}")
+    print(f"  - numPrePeriods: {numPrePeriods}")
+    print(f"  - numPostPeriods: {numPostPeriods}")
+    print(f"  - Mbar grid: {M_grid}")
+    if R_l_vec is not None:
+        print(f"  - l_vec: {l_vec}")
+    print()
 
     kwargs: Dict[str, Any] = dict(
         betahat=R_beta,
         sigma=R_Sigma,
-        numPrePeriods=es.numPrePeriods,
-        numPostPeriods=es.numPostPeriods,
+        numPrePeriods=numPrePeriods,
+        numPostPeriods=numPostPeriods,
         bound="deviation from parallel trends",
         method="C-LF",
         Mbarvec=R_M,
         seed=int(seed or 0),
     )
+
+    raise Exception(sigma)
+
     if R_l_vec is not None:
         kwargs["l_vec"] = R_l_vec
 
-    R_bounds = HonestDiD.createSensitivityResults_relativeMagnitudes(**kwargs)
+    try:
+        R_bounds = HonestDiD.createSensitivityResults_relativeMagnitudes(**kwargs)
+    except Exception as e:
+        raise RuntimeError(f"HonestDiD R call failed: {e}") from e
 
-    # 4) Parse the tibble/data.frame returned by HonestDiD
+    # Parse results
     try:
         df_bounds = pandas2ri.rpy2py(R_bounds)
 
         if not isinstance(df_bounds, pd.DataFrame):
-            raise TypeError(
-                f"Expected HonestDiD to return a DataFrame; got {type(df_bounds)}."
-            )
+            raise TypeError(f"Expected DataFrame; got {type(df_bounds)}")
 
         colmap = {c.lower(): c for c in df_bounds.columns}
+
         lb_col = colmap.get("lb")
         ub_col = colmap.get("ub")
         m_col = colmap.get("mbar") or colmap.get("m")
@@ -259,25 +200,33 @@ def honest_did_bounds(
 
         if lb_col is None or ub_col is None or m_col is None:
             raise KeyError(
-                f"HonestDiD results missing required columns "
-                f"(have: {list(df_bounds.columns)})"
+                f"HonestDiD results missing required columns. "
+                f"Have: {list(df_bounds.columns)}"
             )
 
         lb = df_bounds[lb_col].to_numpy(dtype=float)
         ub = df_bounds[ub_col].to_numpy(dtype=float)
         M = df_bounds[m_col].to_numpy(dtype=float)
+
         method = (
             str(df_bounds[method_col].iloc[0])
             if method_col is not None and len(df_bounds) > 0
             else "C-LF"
         )
+
         delta_label = (
             str(df_bounds[delta_col].iloc[0])
             if delta_col is not None and len(df_bounds) > 0
             else "DeltaRM"
         )
 
+        print(f"HonestDiD Results (Δ^RM):")
+        print(f"  M-grid: {M}")
+        print(f"  Lower bounds: {lb}")
+        print(f"  Upper bounds: {ub}")
+        print()
+
         return HonestDiDResult(M=M, lb=lb, ub=ub, method=method, delta_label=delta_label)
 
-    except Exception as e:  # noqa: BLE001
-        raise RuntimeError(f"Failed to parse HonestDiD relative-magnitude output: {e}") from e
+    except Exception as e:
+        raise RuntimeError(f"Failed to parse HonestDiD output: {e}") from e

@@ -160,7 +160,7 @@ def event_study(
 
     # ------------------------------------------------------------------
     # Tests:
-    #   - pta_p: standard F-test of leads ≤ -2 (pre-trends)
+    #   - pta_p: standard F-ztest of leads ≤ -2 (pre-trends)
     #   - wcb_p: WCB joint test of *all* ES coefficients (pooled experiment)
     # ------------------------------------------------------------------
     es_all_names: List[str] = [c for c in inter_cols if c in m.params.index]
@@ -227,22 +227,7 @@ def event_study(
                 impose_null=impose_null,
                 seed=seed,
             )
-            log_wcb_call(
-                file_name="event_study.py",
-                func_name="WildClusterBootstrap.pvalue",
-                params={
-                    "outcome": outcome_col,
-                    "regressors": regressors,
-                    "fe": fe_terms,
-                    "cluster": cluster_list,
-                    "joint_zero": es_all_names,
-                    "B": B,
-                    "weights": weights,
-                    "impose_null": impose_null,
-                    "seed": seed,
-                },
-                dataframes={"df": wcb_df},
-            )
+
             wcb_val = runner.pvalue(TestSpec(joint_zero=es_all_names))
             if isinstance(wcb_val, float) and not np.isnan(wcb_val):
                 wcb_p = float(wcb_val)

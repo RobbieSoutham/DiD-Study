@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
+from statsmodels.stats.outliers_influence import variance_inflation_factor
 
 from .config import StudyConfig
 from ..estimators.bins import make_dose_bins
@@ -611,8 +612,20 @@ class PanelData:
                 covs_scaler_path = os.path.join(cfg.artifact_dir, "covariates_scaler_prefit.joblib")
                 _joblib.dump({"scaler": scaler, "columns": covar_cols_used, "pre_medians": pre_medians},
                              covs_scaler_path)
-                print(f"[prepare] Saved covariates scaler -> {covs_scaler_path}")
+            print(f"[prepare] Saved covariates scaler -> {covs_scaler_path}")
 
+        covariate_vif: Dict[str, float] = {}
+        if covar_cols_used:
+            vif_data = g[covar_cols_used].dropna()
+            if vif_data.shape[0] >= len(covar_cols_used) + 1:
+                arr = vif_data.astype(float, copy=False).to_numpy()
+                for idx, col in enumerate(covar_cols_used):
+                    try:
+                        covariate_vif[col] = float(variance_inflation_factor(arr, idx))
+                    except (ZeroDivisionError, np.linalg.LinAlgError):
+                        covariate_vif[col] = float("inf")
+                    except Exception:
+                        covariate_vif[col] = float("nan")
         # ---------- (7) Trim units by support (differencing-aware) ----------
         effective_min_pre = max(1, cfg.min_pre - (1 if cfg.differenced else 0))
         effective_min_post = cfg.min_post
@@ -680,6 +693,7 @@ class PanelData:
             "dose_bin_support": dose_bin_support,
             "dose_bin_method": (dose_bin_support or {}).get("method"),
             "dose_bin_edges": (dose_bin_support or {}).get("edges"),
+            "covariate_vif": covariate_vif,
             "pre": int(getattr(cfg, "pre", 0)),
             "post": int(getattr(cfg, "post", 0)),
             "pre": int(getattr(cfg, "pre", 0)),
