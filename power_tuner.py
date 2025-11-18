@@ -294,44 +294,45 @@ def evaluate_config(cfg: StudyConfig, *, alpha: float = 0.05, power_target: floa
     es = getattr(res, "event_study", None) or (res.get("event_study") if isinstance(res, dict) else None)
     pta_p = float(getattr(es, "pta_p", np.nan)) if es is not None else np.nan
 
-    # WCB joint on pre-leads only (try, else NaN)
+    # WCB joint on pre-leads only (try only if WCB requested; else NaN)
     wcb_joint_pre = np.nan
-    try:
-        names_pre: List[str] = list(getattr(es, "names_pre", []) or [])
-        used_df = getattr(es, "data", None)
-        if names_pre and used_df is not None and not used_df.empty:
-            from did_study.robustness.wcb import WildClusterBootstrap, FitSpec, TestSpec
+    if bool(getattr(cfg, "use_wcb", False)):
+        try:
+            names_pre: List[str] = list(getattr(es, "names_pre", []) or [])
+            used_df = getattr(es, "data", None)
+            if names_pre and used_df is not None and not used_df.empty:
+                from did_study.robustness.wcb import WildClusterBootstrap, FitSpec, TestSpec
 
-            outcome = getattr(getattr(res, "data", None), "outcome_name", None)
-            year_col = getattr(cfg, "year_col", "Year")
-            include_unit_fe = not (isinstance(outcome, str) and outcome.lower().startswith("d_"))
-            fe_terms = [f"C({year_col})"]
-            if include_unit_fe:
-                fe_terms.insert(0, "C(unit_id)")
+                outcome = getattr(getattr(res, "data", None), "outcome_name", None)
+                year_col = getattr(cfg, "year_col", "Year")
+                include_unit_fe = not (isinstance(outcome, str) and outcome.lower().startswith("d_"))
+                fe_terms = [f"C({year_col})"]
+                if include_unit_fe:
+                    fe_terms.insert(0, "C(unit_id)")
 
-            covs = list(info.get("covariates_used", []) or [])
-            regressors = names_pre + covs
+                covs = list(info.get("covariates_used", []) or [])
+                regressors = names_pre + covs
 
-            cluster_spec = getattr(cfg, "cluster_col", None)
-            if isinstance(cluster_spec, str):
-                cluster_terms = [cluster_spec]
-            else:
-                cluster_terms = list(cluster_spec or [])
-            if not cluster_terms:
-                cluster_terms = ["unit_id"]
+                cluster_spec = getattr(cfg, "cluster_col", None)
+                if isinstance(cluster_spec, str):
+                    cluster_terms = [cluster_spec]
+                else:
+                    cluster_terms = list(cluster_spec or [])
+                if not cluster_terms:
+                    cluster_terms = ["unit_id"]
 
-            keep_cols = [c for c in set([outcome, "unit_id", year_col] + regressors + cluster_terms) if c in used_df.columns]
-            runner = WildClusterBootstrap(
-                df=used_df[keep_cols].copy(),
-                fit_spec=FitSpec(outcome=outcome, regressors=regressors, fe=fe_terms, cluster=cluster_terms),
-                B=1999,
-                weights="rademacher",
-                seed=getattr(cfg, "seed", None),
-                impose_null=True,
-            )
-            wcb_joint_pre = float(runner.pvalue(TestSpec(joint_zero=names_pre)))
-    except Exception:
-        wcb_joint_pre = np.nan
+                keep_cols = [c for c in set([outcome, "unit_id", year_col] + regressors + cluster_terms) if c in used_df.columns]
+                runner = WildClusterBootstrap(
+                    df=used_df[keep_cols].copy(),
+                    fit_spec=FitSpec(outcome=outcome, regressors=regressors, fe=fe_terms, cluster=cluster_terms),
+                    B=1999,
+                    weights="rademacher",
+                    seed=getattr(cfg, "seed", None),
+                    impose_null=True,
+                )
+                wcb_joint_pre = float(runner.pvalue(TestSpec(joint_zero=names_pre)))
+        except Exception:
+            wcb_joint_pre = np.nan
 
     # HonestDiD robustness
     honest_pass = False
@@ -715,4 +716,11 @@ def write_report(results_df: pd.DataFrame, summary: Dict[str, Any], target_mde: 
             fh.write(report)
     except Exception:
         pass
-    print(report)
+    # Print report with a fallback for Windows consoles that lack UTF-8
+    try:
+        print(report)
+    except Exception:
+        try:
+            print(report.encode("cp1252", errors="ignore").decode("cp1252", errors="ignore"))
+        except Exception:
+            print(report.encode("ascii", errors="ignore").decode("ascii", errors="ignore"))

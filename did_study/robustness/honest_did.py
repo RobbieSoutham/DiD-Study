@@ -164,7 +164,7 @@ def honest_did_bounds(
 
     kwargs: Dict[str, Any] = dict(
         betahat=R_beta,
-        sigma=,
+        sigma=R_Sigma,
         numPrePeriods=numPrePeriods,
         numPostPeriods=numPostPeriods,
         bound="deviation from parallel trends",
@@ -172,8 +172,6 @@ def honest_did_bounds(
         Mbarvec=R_M,
         seed=int(seed or 0),
     )
-
-    raise Exception(R_Sigma)
 
     if R_l_vec is not None:
         kwargs["l_vec"] = R_l_vec
