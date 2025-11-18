@@ -26,6 +26,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--alpha", type=float, default=0.05, help="Significance level")
     p.add_argument("--power", type=float, default=0.80, help="Power target for MDE")
     p.add_argument("--max-candidates", type=int, default=48, help="Max grid candidates to evaluate")
+    p.add_argument("--test", action="store_true", help="Run a single-candidate timing test and exit")
     p.add_argument("--use-wcb", action="store_true", help="Enable WCB in base runs (may require R)")
     p.add_argument("--honestdid", action="store_true", help="Enable HonestDiD in base runs (requires R)")
     return p.parse_args()
@@ -44,14 +45,28 @@ def main() -> None:
         honestdid_enable=bool(args.honestdid),
     )
 
-    print("[PowerTuner] Running grid search (2–3 bins only, VIF-screened covariates)...")
-    results_df, summary = run_search(
-        cfg,
-        target_mde=float(args.target_mde),
-        alpha=float(args.alpha),
-        power_target=float(args.power),
-        max_candidates=int(args.max_candidates),
-    )
+    if args.test:
+        import time
+        print("[PowerTuner][TEST] Running one candidate for timing...")
+        start = time.perf_counter()
+        results_df, summary = run_search(
+            cfg,
+            target_mde=float(args.target_mde),
+            alpha=float(args.alpha),
+            power_target=float(args.power),
+            max_candidates=1,
+        )
+        elapsed = time.perf_counter() - start
+        print(f"[PowerTuner][TEST] elapsed_sec={elapsed:.2f}")
+    else:
+        print("[PowerTuner] Running grid search (2–3 bins only, VIF-screened covariates)...")
+        results_df, summary = run_search(
+            cfg,
+            target_mde=float(args.target_mde),
+            alpha=float(args.alpha),
+            power_target=float(args.power),
+            max_candidates=int(args.max_candidates),
+        )
 
     out_dir = summary["out_dir"]
     print(f"[PowerTuner] Artifacts -> {out_dir}")
@@ -64,4 +79,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

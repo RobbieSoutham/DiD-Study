@@ -15,6 +15,8 @@ except Exception:  # pragma: no cover
 
 from did_study.helpers.config import StudyConfig
 from did_study.study import DidStudy
+import hashlib
+from pathlib import Path
 
 ORIGINAL_COVARS: List[str] = [
     "Demand_heat",
@@ -440,6 +442,43 @@ def evaluate_config(cfg: StudyConfig, *, alpha: float = 0.05, power_target: floa
         "meets_mde": bool(meets_mde),
     }
 
+    # Dataset cache: save prepared panel for this dataset+prep spec
+    try:
+        base_dir = getattr(cfg, "artifact_dir", None) or "./_artifacts"
+        cache_dir = os.path.join(base_dir, "datasets_cache")
+        Path(cache_dir).mkdir(parents=True, exist_ok=True)
+        data_path = getattr(cfg, "_data_path", None)
+        key_parts = [
+            str(data_path or "<mem>"),
+            str(getattr(cfg, "outcome_mode", "direct")),
+            str(getattr(cfg, "use_log_outcome", True)),
+            str(getattr(cfg, "differenced", True)),
+            str(getattr(cfg, "use_lag_levels_in_diff", True)),
+            str(getattr(cfg, "min_pre", 2)),
+            str(getattr(cfg, "min_post", 1)),
+            str(getattr(cfg, "supdem_mode", "sum")),
+            str(getattr(cfg, "treat_threshold", 0.0)),
+            str(getattr(cfg, "dose_quantiles", None)),
+            str(getattr(cfg, "dose_bins", None)),
+            str(getattr(cfg, "n_bins", None)),
+        ]
+        cache_key = hashlib.md5("|".join(key_parts).encode("utf-8")).hexdigest()[:16]
+        panel_path = os.path.join(cache_dir, f"panel_{cache_key}.parquet")
+        info_path = os.path.join(cache_dir, f"panel_{cache_key}.info.json")
+        if not os.path.exists(panel_path):
+            panel_df = getattr(getattr(res, "data", None), "panel", None)
+            if panel_df is not None and hasattr(panel_df, "to_parquet"):
+                try:
+                    panel_df.to_parquet(panel_path, index=False)
+                    with open(info_path, "w", encoding="utf-8") as fh:
+                        json.dump(info, fh, indent=2, default=_json_default)
+                except Exception:
+                    pass
+        row["dataset_cache_key"] = cache_key
+        row["dataset_cache_path"] = panel_path
+    except Exception:
+        pass
+
     return row
 
 def run_search(
@@ -537,11 +576,14 @@ def run_search(
         cand_id += 1
 
     results_df = pd.DataFrame(rows) if rows else pd.DataFrame()
-    if results_df.empty:
-        results_df = pd.DataFrame(columns=[
-            "coef", "se", "p", "p_wcb", "pta_p", "wcb_joint_p", "n_clusters", "mde",
-            "n_bins", "post_share", "thin_bins", "honest_pass", "config_snapshot",
-        ])
+    # Ensure expected columns exist before downstream ops
+    required_cols = [
+        "coef", "se", "p", "p_wcb", "pta_p", "wcb_joint_p", "n_clusters", "mde",
+        "n_bins", "post_share", "thin_bins", "honest_pass", "config_snapshot",
+    ]
+    for c in required_cols:
+        if c not in results_df.columns:
+            results_df[c] = np.nan
 
     results_df["meets_target_mde"] = results_df["mde"].apply(lambda x: (float(x) <= float(target_mde)) if np.isfinite(x) else False)
     results_df["mde_ratio"] = results_df.apply(

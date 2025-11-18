@@ -28,6 +28,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--threads", type=int, default=4, help="Parallel workers (processes)")
     p.add_argument("--use-wcb", action="store_true", help="Enable R-based WCB for pooled ATT and ES pretrend WCB")
     p.add_argument("--honestdid", action="store_true", help="Enable HonestDiD (R) for robustness flags")
+    p.add_argument("--test", action="store_true", help="Run a single-candidate timing test and exit")
     return p.parse_args()
 
 
@@ -42,18 +43,36 @@ def main() -> None:
         honestdid_enable=bool(args.honestdid),
     )
 
-    print(f"[PowerTuner] Parallel run: {args.max_candidates} candidates, threads={args.threads}")
-    results_df, summary = run_search_parallel_from_path(
-        data_path=args.data,
-        base_config_kwargs=base_kwargs,
-        target_mde=float(args.target_mde),
-        threads=int(args.threads),
-        alpha=float(args.alpha),
-        power_target=float(args.power),
-        max_candidates=int(args.max_candidates),
-        use_wcb=bool(args.use_wcb),
-        honestdid=bool(args.honestdid),
-    )
+    if args.test:
+        import time
+        print(f"[PowerTuner][TEST] Parallel one-candidate timing, threads={args.threads}")
+        start = time.perf_counter()
+        results_df, summary = run_search_parallel_from_path(
+            data_path=args.data,
+            base_config_kwargs=base_kwargs,
+            target_mde=float(args.target_mde),
+            threads=int(args.threads),
+            alpha=float(args.alpha),
+            power_target=float(args.power),
+            max_candidates=1,
+            use_wcb=bool(args.use_wcb),
+            honestdid=bool(args.honestdid),
+        )
+        elapsed = time.perf_counter() - start
+        print(f"[PowerTuner][TEST] elapsed_sec={elapsed:.2f}")
+    else:
+        print(f"[PowerTuner] Parallel run: {args.max_candidates} candidates, threads={args.threads}")
+        results_df, summary = run_search_parallel_from_path(
+            data_path=args.data,
+            base_config_kwargs=base_kwargs,
+            target_mde=float(args.target_mde),
+            threads=int(args.threads),
+            alpha=float(args.alpha),
+            power_target=float(args.power),
+            max_candidates=int(args.max_candidates),
+            use_wcb=bool(args.use_wcb),
+            honestdid=bool(args.honestdid),
+        )
 
     out_dir = summary["out_dir"]
     print(f"[PowerTuner] Artifacts -> {out_dir}")
@@ -66,4 +85,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
