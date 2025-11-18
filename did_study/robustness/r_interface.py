@@ -5,11 +5,17 @@ from typing import Any, Sequence, Optional, Dict, List, Tuple
 import numpy as np
 import pandas as pd
 
-import rpy2.robjects as ro
-from rpy2.robjects import pandas2ri
-from rpy2.robjects.conversion import localconverter
-from rpy2.robjects.vectors import FloatVector
-from rpy2.robjects.packages import importr
+
+def _load_rpy2():
+    """Import rpy2 lazily so the package can be imported without R installed."""
+
+    import rpy2.robjects as ro
+    from rpy2.robjects import pandas2ri
+    from rpy2.robjects.conversion import localconverter
+    from rpy2.robjects.vectors import FloatVector
+    from rpy2.robjects.packages import importr
+
+    return ro, pandas2ri, localconverter, FloatVector, importr
 
 
 # ---------------------------------------------------------------------
@@ -21,6 +27,7 @@ def set_r_seeds(seed: Optional[int]) -> None:
     if seed is None:
         return
     s = int(seed)
+    ro, _, _, _, _ = _load_rpy2()
     try:
         ro.r(f"set.seed({s})")
     except Exception:
@@ -83,6 +90,7 @@ def make_feols_in_r(df: pd.DataFrame,
     We keep the sub-dataframe in Python so that clustid lookups are
     well-defined (but boottest() itself only needs the fitted object).
     """
+    ro, pandas2ri, localconverter, _, importr = _load_rpy2()
     fixest = importr("fixest")
 
     used_reg = _sanitize_varlist(df, regressors)
@@ -128,6 +136,7 @@ def _probe_boottest_formals(fn_name: str) -> List[str]:
     We only care about whether 'clustid' and 'type' exist (they do in
     fwildclusterboot >= 0.13).
     """
+    ro, _, _, _, _ = _load_rpy2()
     try:
         return list(ro.r(f"names(formals(fwildclusterboot::{fn_name}))"))
     except Exception:
@@ -170,6 +179,7 @@ def boottest_fixest(*,
       boottest(fixest_fit, param = 'x', B = 9999,
                clustid = 'cluster_col', type = 'rademacher', ...)
     """
+    ro, _, _, _, importr = _load_rpy2()
     fwb = importr("fwildclusterboot")
     set_r_seeds(seed)
 
@@ -205,6 +215,7 @@ def boottest_fixest(*,
         return fwb.boottest(fit, **args_retry)
 
 def _probe_boottest_names(fn_name: str) -> set:
+    ro, _, _, _, importr = _load_rpy2()
     fwb = importr("fwildclusterboot")
     f = getattr(fwb, fn_name)
     try:
@@ -217,7 +228,7 @@ def _probe_boottest_names(fn_name: str) -> set:
 
 def mboottest_fixest(
     df: pd.DataFrame,
-    fit: ro.Environment,                  # kept for API compatibility, unused
+    fit: Any,                  # kept for API compatibility, unused
     joint_params: Optional[Sequence[str]],     # names of coefficients to test jointly
     B: int,
     impose_null: bool,
@@ -262,6 +273,7 @@ def mboottest_fixest(
         Wild cluster bootstrap p-value for H0: all `joint_params` = 0,
         or NaN on failure.
     """
+    ro, _, _, _, importr = _load_rpy2()
     if not joint_params:
         # Nothing to test
         return float("nan")

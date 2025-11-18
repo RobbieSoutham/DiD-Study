@@ -102,49 +102,43 @@ class WildClusterBootstrap:
         """
         self._print_header(test_spec)
 
-        #try:
-        # 1) Joint test: use mboottest_fixest -> returns float p-value
-        if test_spec.joint_zero:
-            pval = mboottest_fixest(
-                df=self._sub_df,
-                fit=self._r_fit,
-                joint_params=list(test_spec.joint_zero),
-                B=self.B,
-                impose_null=self.impose_null,
-                clustid=self.fit_spec.cluster,
-                type_=self.weights,
-            )
-            return float(pval)
+        try:
+            # 1) Joint test: use mboottest_fixest -> returns float p-value
+            if test_spec.joint_zero:
+                pval = mboottest_fixest(
+                    df=self._sub_df,
+                    fit=self._r_fit,
+                    joint_params=list(test_spec.joint_zero),
+                    B=self.B,
+                    impose_null=self.impose_null,
+                    clustid=self.fit_spec.cluster,
+                    type_=self.weights,
+                )
+                return float(pval)
 
-        # 2) Scalar test: use boottest_fixest -> returns R object
-        if test_spec.param is not None:
-            res = boottest_fixest(
-                fit=self._r_fit,
-                df=self._sub_df,
-                param=str(test_spec.param),
-                B=self.B,
-                clustid=self.fit_spec.cluster,
-                type_=self.weights,
-                impose_null=self.impose_null,
-                seed=self.seed,
-            )
+            # 2) Scalar test: use boottest_fixest -> returns R object
+            if test_spec.param is not None:
+                res = boottest_fixest(
+                    fit=self._r_fit,
+                    df=self._sub_df,
+                    param=str(test_spec.param),
+                    B=self.B,
+                    clustid=self.fit_spec.cluster,
+                    type_=self.weights,
+                    impose_null=self.impose_null,
+                    seed=self.seed,
+                )
 
-            # Extract p-value from fwildclusterboot::boottest object
-            try:
+                # Extract p-value from fwildclusterboot::boottest object
                 if "p_val" in res.names:
                     return float(np.array(res.rx2("p_val"))[0])
-                elif "p.value" in res.names:
+                if "p.value" in res.names:
                     return float(np.array(res.rx2("p.value"))[0])
-                else:
-                    # Fallback: treat as scalar numeric
-                    return float(res[0])
-            except Exception as e:  # noqa: BLE001
-                raise RuntimeError(
-                    f"Could not extract p-value from boottest result: {e}"
-                ) from e
 
-        """except Exception as e:
-            print(f"[WCB] R test failed; Reason: {e}")"""
+                # Fallback: treat as scalar numeric
+                return float(res[0])
+        except Exception as e:  # noqa: BLE001
+            print(f"[WCB] R test failed; Reason: {e}")
 
         # If anything goes wrong, return NaN so callers can handle gracefully
         return float("nan")
