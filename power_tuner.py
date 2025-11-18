@@ -724,3 +724,211 @@ def write_report(results_df: pd.DataFrame, summary: Dict[str, Any], target_mde: 
             print(report.encode("cp1252", errors="ignore").decode("cp1252", errors="ignore"))
         except Exception:
             print(report.encode("ascii", errors="ignore").decode("ascii", errors="ignore"))
+
+
+# ==============================================================================
+# Parallel runner (process-based, tqdm progress)
+# ==============================================================================
+
+_PT_GLOBAL: Dict[str, Any] = {"df": None, "small_pos": None}
+
+
+def _pt_init_worker(data_path: str) -> None:
+    import pandas as _pd
+    try:
+        df = _pd.read_csv(data_path)
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"Failed to read data in worker: {e}")
+    _PT_GLOBAL["df"] = df
+    # robust small_pos from eor_capacity column if present
+    sp = 0.0
+    try:
+        if "eor_capacity" in df.columns:
+            vals = _pd.to_numeric(df["eor_capacity"], errors="coerce")
+            vals = vals[vals > 0]
+            if len(vals) > 0:
+                sp = float(vals.median()) * 1e-6
+    except Exception:
+        sp = 0.0
+    _PT_GLOBAL["small_pos"] = sp
+
+
+def _pt_worker_eval(
+    idx: int,
+    overrides: Dict[str, Any],
+    base_kwargs: Dict[str, Any],
+    alpha: float,
+    power_target: float,
+    use_wcb: bool,
+    honestdid: bool,
+) -> Tuple[int, Dict[str, Any]]:
+    df = _PT_GLOBAL.get("df")
+    if df is None:
+        raise RuntimeError("Worker not initialised with data frame.")
+    cfg = StudyConfig(df=df, **base_kwargs)
+    cfg.use_wcb = bool(use_wcb)
+    cfg.honestdid_enable = bool(honestdid)
+    # apply overrides
+    for k, v in overrides.items():
+        if not hasattr(cfg, k):
+            continue
+        if k == "treat_threshold" and v == "small_pos":
+            setattr(cfg, k, float(_PT_GLOBAL.get("small_pos") or 0.0))
+        else:
+            setattr(cfg, k, v)
+    dq = overrides.get("dose_quantiles") or []
+    cfg.n_bins = (len(dq) - 1) if dq else getattr(cfg, "n_bins", None)
+
+    row = evaluate_config(cfg, alpha=alpha, power_target=power_target)
+    row["_candidate_index"] = idx
+    return idx, row
+
+
+def run_search_parallel_from_path(
+    data_path: str,
+    base_config_kwargs: Dict[str, Any],
+    target_mde: float,
+    *,
+    threads: int = 4,
+    alpha: float = 0.05,
+    power_target: float = 0.80,
+    max_candidates: int = 160,
+    use_wcb: bool = False,
+    honestdid: bool = False,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    Parallel search using processes; tracks progress with tqdm and combines results.
+    base_config_kwargs should contain any StudyConfig kwargs except df (e.g., artifact_dir, covariates).
+    """
+    # Template cfg for search-space discovery
+    tmpl = StudyConfig(df=pd.DataFrame(), **{k: v for k, v in base_config_kwargs.items() if k != "df"})
+    grid = make_search_space(tmpl)
+
+    # Build candidate overrides
+    keys = [
+        k for k in [
+            "use_log_outcome",
+            "differenced",
+            "use_lag_levels_in_diff",
+            "outcome_mode",
+            "supdem_mode",
+            "min_pre",
+            "min_post",
+            "treat_threshold",
+            "dose_quantiles",
+            "covariates",
+        ] if k in grid
+    ]
+    vals = [grid[k] for k in keys]
+    from itertools import product as _product
+    cand_list: List[Dict[str, Any]] = []
+    for combo in _product(*vals):
+        overrides = dict(zip(keys, combo))
+        dq = overrides.get("dose_quantiles") or []
+        n_bins = len(dq) - 1 if dq else 0
+        if n_bins in (2, 3):
+            cand_list.append(overrides)
+        if len(cand_list) >= max_candidates:
+            break
+
+    # Output directory
+    root = base_config_kwargs.get("artifact_dir") or "./_artifacts"
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    out_dir = os.path.join(root, f"power_search_{ts}")
+    os.makedirs(os.path.join(out_dir, "runs"), exist_ok=True)
+
+    # Parallel pool
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    try:
+        from tqdm import tqdm  # type: ignore
+    except Exception:
+        def tqdm(x, total=None):
+            return x
+
+    rows: List[Dict[str, Any]] = []
+    futures = []
+    with ProcessPoolExecutor(max_workers=max(1, int(threads)), initializer=_pt_init_worker, initargs=(data_path,)) as ex:
+        for i, ov in enumerate(cand_list):
+            futures.append(ex.submit(_pt_worker_eval, i, ov, base_config_kwargs, alpha, power_target, use_wcb, honestdid))
+
+        for fut in tqdm(as_completed(futures), total=len(futures)):
+            try:
+                idx, row = fut.result()
+            except Exception as e:  # noqa: BLE001
+                row = {"error": str(e), "_candidate_index": -1}
+            rows.append(row)
+            # Per-run persistence
+            try:
+                ridx = row.get("_candidate_index", len(rows)-1)
+                with open(os.path.join(out_dir, "runs", f"run_{ridx}.json"), "w", encoding="utf-8") as fh:
+                    json.dump(row, fh, indent=2, default=_json_default)
+                info = row.get("panel_info")
+                if info is not None:
+                    with open(os.path.join(out_dir, "runs", f"panel_{ridx}.json"), "w", encoding="utf-8") as fh2:
+                        json.dump(info, fh2, indent=2, default=_json_default)
+            except Exception:
+                pass
+
+    # Combine
+    results_df = pd.DataFrame(rows) if rows else pd.DataFrame()
+    if results_df.empty:
+        results_df = pd.DataFrame(columns=[
+            "coef", "se", "p", "p_wcb", "pta_p", "wcb_joint_p", "n_clusters", "mde",
+            "n_bins", "post_share", "thin_bins", "honest_pass", "config_snapshot",
+        ])
+
+    # Derived metrics and sorting like run_search
+    results_df["meets_target_mde"] = results_df["mde"].apply(lambda x: (float(x) <= float(target_mde)) if np.isfinite(x) else False)
+    results_df["mde_ratio"] = results_df.apply(
+        lambda r: (abs(float(r.get("coef", np.nan))) / float(r.get("mde", np.nan))) if (np.isfinite(r.get("coef")) and np.isfinite(r.get("mde")) and float(r.get("mde")) > 0) else np.nan,
+        axis=1,
+    )
+
+    results_df = results_df.sort_values(
+        by=[
+            "meets_target_mde",
+            "p",
+            "p_wcb",
+            "pta_p",
+            "wcb_joint_p",
+            "honest_pass",
+            "mde",
+            "se",
+        ],
+        ascending=[False, True, True, True, True, False, True, True],
+        na_position="last",
+    ).reset_index(drop=True)
+
+    meeting_df = results_df[results_df["meets_target_mde"] == True]  # noqa: E712
+    highlight_df = meeting_df[(meeting_df["p"].apply(lambda x: np.isfinite(x) and x < alpha)) | (meeting_df["p_wcb"].apply(lambda x: np.isfinite(x) and x < alpha))]
+    pta_wcb_df = meeting_df[(meeting_df["pta_p"].apply(lambda x: np.isfinite(x) and x < alpha)) & (meeting_df["wcb_joint_p"].apply(lambda x: np.isfinite(x) and x < alpha))]
+    robust_df = meeting_df[meeting_df["honest_pass"] == True]  # noqa: E712
+
+    best_overall = results_df.iloc[0].to_dict() if not results_df.empty else {}
+
+    summary = {
+        "out_dir": out_dir,
+        "meeting_count": int(meeting_df.shape[0]),
+        "highlight_count": int(highlight_df.shape[0]),
+        "pta_wcb_count": int(pta_wcb_df.shape[0]),
+        "robust_count": int(robust_df.shape[0]),
+        "meeting_ids": meeting_df.index.tolist(),
+        "highlight_ids": highlight_df.index.tolist(),
+        "pta_wcb_ids": pta_wcb_df.index.tolist(),
+        "robust_ids": robust_df.index.tolist(),
+        "best_overall": best_overall,
+    }
+
+    # Persist CSVs and winner
+    try:
+        results_df.to_csv(os.path.join(out_dir, "results_df.csv"), index=True)
+        meeting_df.to_csv(os.path.join(out_dir, "meeting_configs.csv"), index=True)
+        highlight_df.to_csv(os.path.join(out_dir, "highlight_configs.csv"), index=True)
+        pta_wcb_df.to_csv(os.path.join(out_dir, "pta_wcb_configs.csv"), index=True)
+        robust_df.to_csv(os.path.join(out_dir, "robust_configs.csv"), index=True)
+        with open(os.path.join(out_dir, "winner.json"), "w", encoding="utf-8") as fh:
+            json.dump(best_overall, fh, indent=2, default=_json_default)
+    except Exception:
+        pass
+
+    return results_df, summary

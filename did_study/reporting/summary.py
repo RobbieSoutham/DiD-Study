@@ -761,6 +761,29 @@ def study_printable_from_didstudy(results: Dict[str, Any]) -> StudyPrintable:
     att_obj = _res_pick(results, "att", "att_pooled")
     att_d = _as_dict(att_obj)
 
+    # differences-based ATT^o (test)
+    att_test_obj = _res_pick(results, "att_test")
+    att_test: Dict[str, Any] = {}
+    if att_test_obj is not None:
+        try:
+            if isinstance(att_test_obj, dict):
+                for k in ("att_overall", "se_overall", "p_overall"):
+                    if k in att_test_obj:
+                        att_test[k] = att_test_obj[k]
+            else:
+                att_test = {
+                    "att_overall": getattr(att_test_obj, "att_overall", np.nan),
+                    "se_overall": getattr(att_test_obj, "se_overall", np.nan),
+                    "p_overall": getattr(att_test_obj, "p_overall", np.nan),
+                }
+                used = getattr(att_test_obj, "used", None)
+                if isinstance(used, pd.DataFrame):
+                    att_test["n_obs"] = int(len(used))
+                    if "unit_id" in used.columns:
+                        att_test["n_clusters"] = int(used["unit_id"].nunique())
+        except Exception:
+            att_test = {}
+
     wcb_info = _res_pick(results, "wcb_info")
     if wcb_info is None:
         wcb_meta = _res_pick(results, "wcb_meta")
@@ -873,6 +896,7 @@ def study_printable_from_didstudy(results: Dict[str, Any]) -> StudyPrintable:
         wcb_bins_equal_p=wcb_equal_p,
         wcb_bins_info=wcb_bins_info,
         panel_df=panel_df,
+        att_test=att_test or None,
     )
 
 # ================================
@@ -888,6 +912,11 @@ def print_and_plot_summary(
     """One-call pretty summary with plots."""
     print_panel_block(sp.panel_info)
     print_att_pooled_block(sp.att_pooled, sp.att_bins)
+    # Also show differences-based ATT^o if available
+    try:
+        print_att_test_block(sp.att_test)
+    except Exception:
+        pass
     print_att_bins_block(
         sp.att_bins,
         sp.wcb_bins_equal_p,
@@ -1022,6 +1051,11 @@ class StudyReporter:
     def show_all(self) -> None:
         self.show_overview()
         self.show_att_pooled()
+        # Show test ATT^o (differences) if present
+        try:
+            print_att_test_block(self.sp.att_test)
+        except Exception:
+            pass
         self.show_att_bins()
         # Unified table:
         print_att_summary_table(self.sp.att_pooled, self.sp.att_bins)
