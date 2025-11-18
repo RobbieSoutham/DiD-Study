@@ -8,9 +8,14 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 import pandas as pd
-from rpy2 import robjects as ro
-from rpy2.robjects import pandas2ri
-from rpy2.robjects.packages import importr
+
+
+def _load_rpy2():
+    import rpy2.robjects as ro
+    from rpy2.robjects import pandas2ri
+    from rpy2.robjects.packages import importr
+
+    return ro, pandas2ri, importr
 
 from did_study.robustness.r_interface import set_r_seeds
 
@@ -92,6 +97,8 @@ def honest_did_bounds(
     RuntimeError
         If HonestDiD R call fails.
     """
+
+    ro, pandas2ri, importr = _load_rpy2()
 
     # Validate inputs
     if not isinstance(betas, np.ndarray):
