@@ -28,92 +28,74 @@ def estimate_att_o(
     *,
     wcb_args: Optional[Dict[str, Any]] = None,
 ) -> AttResult:
+    # Implement two-period long-difference ATT^o (treated vs untreated)
     df = panel.panel.copy()
     outcome = panel.outcome_name
     cluster_col = "unit_id"
     year_col = config.year_col
 
-    include_unit_fe_default = not outcome.lower().startswith("d_")
-    default_fe: List[str] = [year_col]
-    if include_unit_fe_default:
-        default_fe.insert(0, cluster_col)
-    fe_terms = list(fe_terms) if fe_terms else default_fe
+    need_cols = [outcome, cluster_col, year_col, "treated_ever"]
+    if any(c not in df.columns for c in need_cols):
+        used_empty = df[[c for c in need_cols if c in df.columns]].copy()
+        return AttResult(np.nan, np.nan, np.nan, np.nan, None, used_empty)
 
-    covs = panel.info.get("covariates_used", []) or []
-    need = [outcome, "treated_now", cluster_col, year_col] + covs
-    used = df.dropna(subset=[c for c in need if c in df.columns]).copy()
-    if used.empty or used[cluster_col].nunique() < 2:
-        return AttResult(np.nan, np.nan, np.nan, np.nan, None, used)
+    pre_h = int(getattr(config, "pre", 3) or 3)
+    post_h = int(getattr(config, "post", 5) or 5)
 
-    fe_rhs = [f"C({c})" for c in fe_terms]
-    rhs = ["treated_now"] + covs + fe_rhs
-    formula = f"{outcome} ~ " + " + ".join(rhs)
+    treated_mask = (df.get("treated_ever", 0) == 1) & df.get("g").notna()
+    treated_units = df.loc[treated_mask, [cluster_col, "g"]].drop_duplicates()
 
-    groups = pd.factorize(used[cluster_col])[0]
-    m = smf.ols(formula, data=used).fit(cov_type="cluster", cov_kwds={"groups": groups})
-    coef = float(m.params.get("treated_now", np.nan))
-    se = float(m.bse.get("treated_now", np.nan))
-    p = float(m.pvalues.get("treated_now", np.nan))
+    pre_years: set[int] = set()
+    post_years: set[int] = set()
+    for _, row in treated_units.iterrows():
+        g_i = int(row["g"])  # type: ignore[arg-type]
+        pre_years.update(range(g_i - pre_h, g_i))
+        post_years.update(range(g_i, g_i + post_h + 1))
 
-    n_clusters = int(used[cluster_col].nunique())
-    n_obs = int(len(used))
-    mde_val = float("nan")
-    if np.isfinite(se) and n_clusters > 1:
-        try:
-            mde_val = analytic_mde_from_se(se, n_clusters)
-        except Exception:
-            mde_val = float("nan")
+    rows: List[Dict[str, Any]] = []
+    for uid, d_u in df.groupby(cluster_col, sort=False):
+        ever = int(d_u["treated_ever"].iloc[0]) if not d_u.empty else 0
+        if ever == 1 and "g" in d_u.columns and d_u["g"].notna().any():
+            g_i = int(d_u["g"].dropna().iloc[0])
+            mask_pre = (d_u[year_col] >= (g_i - pre_h)) & (d_u[year_col] <= (g_i - 1))
+            mask_post = (d_u[year_col] >= g_i) & (d_u[year_col] <= (g_i + post_h))
+        else:
+            if not pre_years or not post_years:
+                continue
+            mask_pre = d_u[year_col].isin(pre_years)
+            mask_post = d_u[year_col].isin(post_years)
 
-    p_wcb = np.nan
-    if wcb_args:
-        try:
-            base_terms = ["treated_now"] + covs
-            cluster_spec = (
-                wcb_args.get("cluster_terms")
-                or wcb_args.get("cluster_spec")
-                or cluster_col
-            )
-            if isinstance(cluster_spec, str):
-                cluster_list = [cluster_spec]
-            else:
-                cluster_list = list(cluster_spec or [])
-            cluster_list = [c for c in cluster_list if c in used.columns]
-            if not cluster_list:
-                cluster_list = [cluster_col]
+        y_pre = d_u.loc[mask_pre, outcome].dropna()
+        y_post = d_u.loc[mask_post, outcome].dropna()
+        if y_pre.empty or y_post.empty:
+            continue
+        delta = float(y_post.mean() - y_pre.mean())
+        rows.append({cluster_col: uid, "treated_ever": ever, "delta_y": delta})
 
-            impose_null = bool(wcb_args.get("impose_null", True))
-            B = int(wcb_args.get("B", 9999))
-            weights = wcb_args.get("weights", "rademacher")
-            seed = wcb_args.get("seed")
+    collapsed = pd.DataFrame(rows)
+    if collapsed.empty or collapsed[cluster_col].nunique() < 2:
+        return AttResult(np.nan, np.nan, np.nan, np.nan, None, collapsed)
 
-            candidate_cols = (
-                [outcome, cluster_col, year_col]
-                + base_terms
-                + fe_terms
-                + cluster_list
-            )
-            wcb_cols: List[str] = []
-            for col in candidate_cols:
-                if col in used.columns and col not in wcb_cols:
-                    wcb_cols.append(col)
-            wcb_df = used[wcb_cols].copy()
+    try:
+        groups = pd.factorize(collapsed[cluster_col])[0]
+        m = smf.ols("delta_y ~ treated_ever", data=collapsed).fit(
+            cov_type="cluster", cov_kwds={"groups": groups}
+        )
+        coef = float(m.params.get("treated_ever", np.nan))
+        se = float(m.bse.get("treated_ever", np.nan))
+        p = float(m.pvalues.get("treated_ever", np.nan))
+    except Exception:
+        m = None
+        coef = se = p = float("nan")
 
-            runner = make_wcb_runner(
-                df=wcb_df,
-                outcome=outcome,
-                regressors=base_terms,
-                fe=list(fe_terms or []),
-                cluster=cluster_list,
-                B=B,
-                weights=weights,
-                impose_null=impose_null,
-                seed=seed,
-            )
-            p_wcb = runner.pvalue(TestSpec(param="treated_now"))
-        except Exception as e:
-            print("[WCB] failed; returning NaN. Reason:", repr(e))
+    n_clusters = int(collapsed[cluster_col].nunique())
+    n_obs = int(len(collapsed))
+    try:
+        mde_val = analytic_mde_from_se(se, n_clusters) if np.isfinite(se) and n_clusters > 1 else float("nan")
+    except Exception:
+        mde_val = float("nan")
 
-    result = AttResult(coef, se, p, p_wcb, m, used)
+    result = AttResult(coef, se, p, np.nan, m, collapsed)
     result.n_clusters = n_clusters
     result.clusters = n_clusters
     result.n_obs = n_obs

@@ -12,6 +12,7 @@ import pandas as pd
 from .helpers.config import StudyConfig
 from .helpers.preparation import PanelData
 from .estimator import DidEstimator
+from .estimators.att_differences import DifferencesAttResult
 from .robustness.honest_did import honest_did_bounds
 from .helpers.utils import choose_wcb_weights_and_B
 
@@ -24,6 +25,7 @@ class DidStudyResult:
 
     # Core estimators
     att: Optional[Any] = None
+    att_test: Optional[DifferencesAttResult] = None  # 'true' ATT^o via differences
     bins: Optional[Any] = None
     event_study: Optional[Any] = None
 
@@ -141,6 +143,12 @@ class DidStudy:
         # 4) ATT^o (pooled)
         if run_att:
             result.att = self.estimator.estimate_att_o(panel=panel, wcb_args=wcb_args)
+            # 'test' ATT^o via differences (Callaway–Sant'Anna ATTgt)
+            try:
+                result.att_test = self.estimator.estimate_att_o_differences(panel=panel)
+            except Exception as e:
+                print("[differences ATT^o] failed:", repr(e))
+                result.att_test = None
 
         # 5) Bins
         has_dose_bins = bool(df is not None and "dose_bin" in df.columns)

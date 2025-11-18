@@ -288,6 +288,8 @@ class StudyPrintable:
     wcb_bins_info: Optional[Dict[str, Any]] = None
 
     panel_df: Optional[pd.DataFrame] = None
+    # New: differences-based pooled ATT^o (test)
+    att_test: Optional[Dict[str, Any]] = None
 
 # ================================
 # Back-compat print blocks (still used internally)
@@ -334,7 +336,7 @@ def print_panel_block(info: Dict[str, Any]) -> None:
         )
 
 def print_att_pooled_block(att: Dict[str, Any], att_bins: Optional[pd.DataFrame] = None) -> None:
-    _rule("ATT^o (pooled)")
+    _rule("ATT^o (long-diff, treated vs untreated)")
     coef = float(att["coef"])
     se = float(att.get("se", np.nan))
     lo = float(att.get("lo", coef - 1.96 * se))
@@ -363,11 +365,31 @@ def print_att_pooled_block(att: Dict[str, Any], att_bins: Optional[pd.DataFrame]
         plot_att_combined(
             coef=coef, lo=lo, hi=hi,
             bins_df=att_bins,
-            title="ATT$^{o}$ (pooled + by bin)",
+            title="ATT$^{o}$ (long-diff + by bin)",
             ylabel="Effect (Deltalog units)"
         )
     else:
-        plot_att_pooled_point(coef=coef, lo=lo, hi=hi, title="ATT$^{o}$ (pooled)", ylabel="Effect (Deltalog units)")
+        plot_att_pooled_point(coef=coef, lo=lo, hi=hi, title="ATT$^{o}$ (long-diff)", ylabel="Effect (Deltalog units)")
+
+
+def print_att_test_block(att_test: Optional[Dict[str, Any]]) -> None:
+    """Print the 'test' ATT^o estimated via the `differences` package (ATTgt).
+
+    Expects a dict with keys: 'att_overall', 'se_overall', 'p_overall'.
+    """
+    if not att_test:
+        return
+    try:
+        att = float(att_test.get("att_overall", np.nan))
+        se = float(att_test.get("se_overall", np.nan))
+        p = float(att_test.get("p_overall", np.nan))
+    except Exception:
+        return
+    if not np.isfinite(att):
+        return
+    se_txt = f"{se:.3f}" if np.isfinite(se) else "NA"
+    p_txt = _fmt_p(p)
+    print(f"\nATT^o (differences package, 'test' ATT^o): {att:.3f} (SE={se_txt}, p={p_txt})")
 
 def print_att_bins_block(
     tbl: pd.DataFrame,
@@ -531,7 +553,7 @@ def print_overall_support(
     p_stars = _fmt_p_with_stars(p)
     pw_stars = _fmt_p_with_stars(pw) if pw is not None else "NA"
 
-    print(f"\nATT^o (pooled):")
+    print(f"\nATT^o (long-diff, treated vs untreated):")
     print(f"  Estimate: {coef:.4f} (p = {p_stars}, WCB p = {pw_stars})")
 
     # MDE comparison

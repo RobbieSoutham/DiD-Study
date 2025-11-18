@@ -8,6 +8,10 @@ from did_study.helpers.config import StudyConfig
 from did_study.helpers.preparation import PanelData
 from did_study.estimators.base import BaseEstimator
 from did_study.estimators.att import AttResult, estimate_att_o
+from did_study.estimators.att_differences import (
+    DifferencesAttResult,
+    estimate_att_o_differences,
+)
 from did_study.estimators.bins import BinAttResult, estimate_binned_att_o
 from did_study.estimators.event_study import EventStudyResult, event_study
 
@@ -56,6 +60,12 @@ class DidEstimator(BaseEstimator):
         wcb_args: Optional[Dict[str, Any]] = None,
     ) -> EventStudyResult:
         return event_study(panel, self.config, fe_terms=fe_terms, wcb_args=wcb_args)
+
+    # ---------------------------------------------------------
+    # ATT^o via `differences` (Callaway–Sant'Anna ATTgt)
+    # ---------------------------------------------------------
+    def estimate_att_o_differences(self, panel: PanelData) -> DifferencesAttResult:
+        return estimate_att_o_differences(panel=panel, config=self.config)
 
     # ---------------------------------------------------------
     # Event study by *dose bin*
