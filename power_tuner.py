@@ -252,6 +252,12 @@ def _json_default(o: Any) -> Any:  # pragma: no cover
             return o.tolist()
     except Exception:
         pass
+    # sets -> sorted lists for JSON
+    try:
+        if isinstance(o, set):
+            return sorted(list(o))
+    except Exception:
+        pass
     try:
         from dataclasses import asdict as _asdict
         return _asdict(o)
@@ -266,6 +272,29 @@ def _json_default(o: Any) -> Any:  # pragma: no cover
     except Exception:
         pass
     return None
+
+
+def _serialize_config(cfg: StudyConfig) -> Dict[str, Any]:
+    """Turn StudyConfig into a JSON-serialisable dict (drop df; normalise sets)."""
+    out: Dict[str, Any] = {}
+    for k, v in vars(cfg).items():
+        if k == "df":
+            continue
+        # normalise sets in mapping-like structures
+        if isinstance(v, dict):
+            try:
+                norm = {}
+                for kk, vv in v.items():
+                    if isinstance(vv, set):
+                        norm[kk] = sorted(list(vv))
+                    else:
+                        norm[kk] = vv
+                out[k] = norm
+            except Exception:
+                out[k] = v
+        else:
+            out[k] = v
+    return out
 
 def evaluate_config(cfg: StudyConfig, *, alpha: float = 0.05, power_target: float = 0.80) -> Dict[str, Any]:
     overrides: Dict[str, Any] = {}
@@ -440,6 +469,8 @@ def evaluate_config(cfg: StudyConfig, *, alpha: float = 0.05, power_target: floa
         "panel_info": _select_panel_info_fields(info),
         "meets_sig": bool(meets_sig),
         "meets_mde": bool(meets_mde),
+        # persist full configuration (sans df) for reproducibility
+        "config_full": _serialize_config(cfg),
     }
 
     # Dataset cache: save prepared panel for this dataset+prep spec
@@ -700,6 +731,17 @@ def write_report(results_df: pd.DataFrame, summary: Dict[str, Any], target_mde: 
     lines.append(f"Target MDE: {target_mde:.6g}; alpha={alpha}")
     lines.append("MDE formula: (t_{1−α/2, G−1} + t_{power, G−1}) × SE")
 
+    # Ensure helper flags exist
+    if "meets_mde" not in results_df.columns:
+        try:
+            results_df = results_df.copy()
+            results_df["meets_mde"] = results_df.apply(
+                lambda r: (np.isfinite(r.get("coef")) and np.isfinite(r.get("mde")) and abs(float(r.get("coef", np.nan))) >= float(r.get("mde", np.nan))),
+                axis=1,
+            )
+        except Exception:
+            results_df["meets_mde"] = False
+
     meeting = results_df[results_df["meets_target_mde"] == True]  # noqa: E712
     robust = meeting[(meeting["pta_p"].apply(lambda x: np.isfinite(x) and x < alpha)) & (meeting["wcb_joint_p"].apply(lambda x: np.isfinite(x) and x < alpha)) & (meeting["honest_pass"] == True)]  # noqa: E712
 
@@ -715,7 +757,37 @@ def write_report(results_df: pd.DataFrame, summary: Dict[str, Any], target_mde: 
         f"Counts — meeting: {int(meeting.shape[0])}, highlighted (significant): {int(((meeting['p']<alpha) | (meeting['p_wcb']<alpha)).sum())}, PTA+WCB clean: {int(((meeting['pta_p']<alpha) & (meeting['wcb_joint_p']<alpha)).sum())}, HonestDiD-pass: {int((meeting['honest_pass']==True).sum())}."  # noqa: E712
     )
 
-    lines.append("\n## Top Configurations")
+    # Focus set: configs with MDE < |effect|
+    focus = results_df[results_df["meets_mde"] == True].copy()  # noqa: E712
+    focus = focus.sort_values(["mde", "se", "p"]) if not focus.empty else focus
+
+    lines.append("\n## Configs with MDE < |effect| (best first)")
+    if focus.empty:
+        lines.append("(None in this run.)")
+    else:
+        head = focus.head(25)
+        for _, row in head.iterrows():
+            snap = row.get("config_snapshot", {}) or {}
+            dq = snap.get("dose_quantiles")
+            flags = []
+            if (np.isfinite(row.get("p")) and float(row.get("p")) < alpha) or (np.isfinite(row.get("p_wcb")) and float(row.get("p_wcb")) < alpha):
+                flags.append("★ sig")
+            if np.isfinite(row.get("pta_p")) and float(row.get("pta_p")) < alpha:
+                flags.append("✓ PTA")
+            if np.isfinite(row.get("wcb_joint_p")) and float(row.get("wcb_joint_p")) < alpha:
+                flags.append("Ⓦ WCB-pre")
+            if bool(row.get("honest_pass")):
+                flags.append("✔ HonestDiD")
+            lines.append(
+                "- "
+                + f"mde={row.get('mde'):.4g}, |coef|={abs(row.get('coef')):.4g}, ratio={row.get('mde_ratio'):.4g}; "
+                + f"p={row.get('p')}, p_wcb={row.get('p_wcb')}, pta_p={row.get('pta_p')}, wcb_pre={row.get('wcb_joint_p')}; "
+                + f"n_clusters={row.get('n_clusters')}, post_share={row.get('post_share')}; dose_quantiles={dq}, n_bins={int(row.get('n_bins', 0))}; "
+                + f"min_pre={snap.get('min_pre')}, min_post={snap.get('min_post')}, supdem_mode={snap.get('supdem_mode')}, differenced={snap.get('differenced')}, log={snap.get('use_log_outcome')}"
+                + ("; [" + ", ".join(flags) + "]" if flags else "")
+            )
+
+    lines.append("\n## Top Configurations (overall)")
     top = results_df.head(10).copy()
     for _, row in top.iterrows():
         snap = row.get("config_snapshot", {}) or {}
@@ -744,6 +816,26 @@ def write_report(results_df: pd.DataFrame, summary: Dict[str, Any], target_mde: 
             lines.append(f"- {s}")
     except Exception:
         lines.append("- Drivers analysis unavailable")
+
+    # Pattern-based recommendations from focus set
+    lines.append("\n## Recommendations (patterns from MDE < |effect| set)")
+    if not focus.empty:
+        try:
+            # Summaries
+            nbins_counts = focus["n_bins"].value_counts().to_dict()
+            diff_counts = focus["config_snapshot"].apply(lambda s: bool(s.get("differenced", False))).value_counts().to_dict()
+            lag_counts = focus["config_snapshot"].apply(lambda s: bool(s.get("use_lag_levels_in_diff", False))).value_counts().to_dict()
+            sup_counts = focus["config_snapshot"].apply(lambda s: str(s.get("supdem_mode", "sum"))).value_counts().to_dict()
+            pre_med = focus["config_snapshot"].apply(lambda s: int(s.get("min_pre", 0))).median()
+            post_med = focus["config_snapshot"].apply(lambda s: int(s.get("min_post", 0))).median()
+            lines.append(f"- Bins: prefer {max(nbins_counts, key=nbins_counts.get)} bins within [2,3]; ensure per-bin support.")
+            lines.append(f"- Differenced: {diff_counts.get(True,0)} of {focus.shape[0]} focused configs use differencing; lag-in-diff True in {lag_counts.get(True,0)}.")
+            lines.append(f"- Supply/Demand mapping: dominant mode is '{max(sup_counts, key=sup_counts.get)}'.")
+            lines.append(f"- Support windows: median min_pre≈{pre_med}, min_post≈{post_med} across focused configs.")
+        except Exception:
+            lines.append("- Focus-set pattern extraction unavailable.")
+    else:
+        lines.append("- No configs with MDE < |effect| yet. Prioritize 2-bin splits [0,.5,1] or [0,.4,1], increase post support, and keep VIF pruning.")
 
     report = "\n".join(lines)
     # Diagnostics on MDE audit
