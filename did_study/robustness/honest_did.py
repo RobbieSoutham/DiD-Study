@@ -142,6 +142,7 @@ def honest_did_bounds(
     R_Sigma = ro.r["matrix"](
         ro.FloatVector(Sigma.ravel(order="C")),
         nrow=Sigma.shape[0],
+         ncol=Sigma.shape[1],
     )
     R_M = ro.FloatVector(M_grid.tolist())
     R_l_vec = None
@@ -218,7 +219,8 @@ def honest_did_bounds(
             else "DeltaRM"
         )
 
-        print(f"HonestDiD Results (Δ^RM):")
+        # ASCII-only to avoid Windows console encoding issues
+        print("HonestDiD Results (Delta^RM):")
         print(f"  M-grid: {M}")
         print(f"  Lower bounds: {lb}")
         print(f"  Upper bounds: {ub}")

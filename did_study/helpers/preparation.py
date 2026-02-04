@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, Tuple, List, Optional
+import os
 
 import os
 from pathlib import Path
@@ -17,6 +18,13 @@ from ..estimators.bins import make_dose_bins
 from .defaults import DEFAULT_MAPPING
 
 _SECTORAL_PREFIXES = ("Supply_", "Demand_")
+
+# Verbose toggle for console prints (default: quiet)
+_PREP_VERBOSE = str(os.environ.get("DID_STUDY_PREP_VERBOSE", "0")).lower() in {"1", "true", "yes", "on"}
+
+def _p(*args, **kwargs) -> None:
+    if _PREP_VERBOSE:
+        print(*args, **kwargs)
 
 
 # ----------------------------
@@ -220,6 +228,10 @@ class PanelData:
 
         # Assign bin only to post rows; pre rows keep NaN
         g["dose_bin"] = np.where(g["post"] == 1, g["bin_cohort"], pd.NA)
+        try:
+            g["dose_bin"] = g["dose_bin"].astype("category")
+        except Exception:
+            pass
 
         # Support diagnostics (post rows only)
         post_rows = g.loc[g["post"] == 1]
@@ -232,7 +244,7 @@ class PanelData:
             "rows": sup_rows.to_dict(),
         }
 
-        print(f"[prepare][bins] absorbing ({method_used}); edges={support['edges']}")
+        _p(f"[prepare][bins] absorbing ({method_used}); edges={support['edges']}")
         for b in sorted([x for x in post_rows["dose_bin"].dropna().unique()], key=str):
             if str(b) == "untreated":
                 continue
@@ -240,21 +252,25 @@ class PanelData:
             r = int(sup_rows.get(b, 0))
             doses = g.loc[(g["dose_bin"] == b) & (g["post"] == 1), "dose_level"]
             if doses.empty:
-                print(f"  - {b}: units={u}, rows={r}")
+                _p(f"  - {b}: units={u}, rows={r}")
                 continue
             mean_dose = doses.mean()
             cv = (doses.std() / mean_dose) if mean_dose not in (0, np.nan) else np.nan
             msg = f"  - {b}: units={u}, rows={r}, dose range=[{doses.min():.1f}, {doses.max():.1f}]"
             if np.isfinite(cv):
                 msg += f", CV={cv:.2f}"
-            print(msg)
+            _p(msg)
 
         return g, support
 
     # ---------- main builder
     def _prepare(self) -> None:
         cfg = self.config
-        d = cfg.df.copy()
+        # Shallow view + copy-on-write reduces memory overhead vs deep copy
+        try:
+            d = cfg.df.copy(deep=False)
+        except Exception:
+            d = cfg.df
 
         # required columns
         need = {
@@ -284,6 +300,10 @@ class PanelData:
                     .sort_values([country_col, cfg.year_col])
             )
             g["unit_id"] = g[country_col].astype(str)
+            try:
+                g["unit_id"] = g["unit_id"].astype("category")
+            except Exception:
+                pass
             unit_level = "country"
         else:
             grid = d[[country_col, ccus_col, cfg.year_col]].drop_duplicates()
@@ -298,6 +318,10 @@ class PanelData:
                     .sort_values([country_col, ccus_col, cfg.year_col])
             )
             g["unit_id"] = g[country_col].astype(str) + "_" + g[ccus_col].astype(str)
+            try:
+                g["unit_id"] = g["unit_id"].astype("category")
+            except Exception:
+                pass
             unit_level = "sector"
 
         g["dose_level"] = g["dose_level"].fillna(0.0)
@@ -567,14 +591,14 @@ class PanelData:
                     else:
                         cname = col0
                 _append_if_valid(cname)
-        else:
+        """else:
             # Conservative defaults
-            defaults = ["renewable_to_fossil_supply_ratio"]
-            if "energy_demand_fossil_fuels" in g.columns:
-                defaults.append("energy_demand_fossil_fuels")
+            #defaults = ["renewable_to_fossil_supply_ratio"]
+            #if "energy_demand_fossil_fuels" in g.columns:
+                #defaults.append("energy_demand_fossil_fuels")
             # include nuclear share by default but respect FD rule
-            defaults.append("nuclear_share_supply")
-
+            #defaults.append("nuclear_share_supply")
+            
             for base in defaults:
                 col0 = _resolve_base(base) or base
                 if cfg.differenced and prefer_lag_if_fd:
@@ -586,7 +610,7 @@ class PanelData:
                     g[cname] = g.groupby("unit_id", sort=False)[col0].diff()
                 else:
                     cname = col0
-                _append_if_valid(cname)
+                _append_if_valid(cname)"""
 
         # leakage-safe scaling (fit on pre rows only)
         covs_scaler_path = None
@@ -612,7 +636,7 @@ class PanelData:
                 covs_scaler_path = os.path.join(cfg.artifact_dir, "covariates_scaler_prefit.joblib")
                 _joblib.dump({"scaler": scaler, "columns": covar_cols_used, "pre_medians": pre_medians},
                              covs_scaler_path)
-            print(f"[prepare] Saved covariates scaler -> {covs_scaler_path}")
+                _p(f"[prepare] Saved covariates scaler -> {covs_scaler_path}")
 
         covariate_vif: Dict[str, float] = {}
         if covar_cols_used:
@@ -631,25 +655,34 @@ class PanelData:
         effective_min_post = cfg.min_post
         keep_units: List[str] = []
         for uid, dfu in g.groupby("unit_id", sort=False):
-            ever = int(dfu["treated_ever"].iloc[0])
+            # Guard against pathological empty groups
+            if dfu.empty:
+                continue
+
+            ever = int(dfu.get("treated_ever", 0).iloc[0]) if "treated_ever" in dfu.columns else 0
             if ever:
-                pre = dfu[dfu[cfg.year_col] < dfu["g"].iloc[0]]
-                post = dfu[dfu["post"] == 1]
+                # Require a valid first treatment year g for treated units
+                if "g" not in dfu.columns or dfu["g"].dropna().empty:
+                    continue
+                g_i = dfu["g"].dropna().iloc[0]
+                pre = dfu[dfu[cfg.year_col] < g_i]
+                post = dfu[dfu.get("post", 0) == 1]
                 if len(pre) >= effective_min_pre and len(post) >= effective_min_post:
                     keep_units.append(uid)
             else:
+                # Never-treated units: require enough distinct years overall
                 if dfu[cfg.year_col].nunique() >= (effective_min_pre + effective_min_post):
                     keep_units.append(uid)
         dropped_units = sorted(set(g["unit_id"].unique()) - set(keep_units))
         if dropped_units:
-            print(f"[prepare] Dropped {len(dropped_units)} units with insufficient pre/post support.")
+            _p(f"[prepare] Dropped {len(dropped_units)} units with insufficient pre/post support.")
         g = g[g["unit_id"].isin(keep_units)].copy()
 
         # ---------- (8) Bin diagnostics after trimming (no re-binning) ----------
-        for b in sorted(g[g["dose_bin"].notna()]["dose_bin"].unique()):
-            doses = g.loc[(g["dose_bin"] == b) & (g["post"] == 1), "dose_level"]
-            print(f"  - {b}: dose range=[{doses.min():.1f}, {doses.max():.1f}], "
-                f"CV={doses.std() / doses.mean():.2f}")
+        if "dose_bin" in g.columns:
+            for b in sorted(g[g["dose_bin"].notna()]["dose_bin"].unique()):
+                doses = g.loc[(g["dose_bin"] == b) & (g["post"] == 1), "dose_level"]
+                _p(f"  - {b}: dose range=[{doses.min():.1f}, {doses.max():.1f}], CV={doses.std() / doses.mean():.2f}")
             
 
         # Add to preparation.py
@@ -659,20 +692,21 @@ class PanelData:
         post = treated[treated["post"] == 1].groupby("unit_id")["nuclear_share_supply"].mean()
         delta = post - pre
         if abs(delta.mean()) > 0.05:  # 5 percentage point threshold
-            print(f"[WARNING] nuclear_share_supply changes {delta.mean():.3f} post-treatment (potential bad control)")
+            _p(f"[WARNING] nuclear_share_supply changes {delta.mean():.3f} post-treatment (potential bad control)")
 
 
         # ---------- (9) Stats & info ----------
         units = g["unit_id"].nunique()
         ever = int(g.groupby("unit_id")["treated_ever"].max().sum())
         treated_rows = int((g["post"] == 1).sum())
-        print("=== PANEL STATS ===")
-        print(f"Units: {units} | Ever-treated: {ever} | Obs: {len(g)} | Post rows: {treated_rows} ({treated_rows/len(g):.1%})")
+        _p("=== PANEL STATS ===")
+        _p(f"Units: {units} | Ever-treated: {ever} | Obs: {len(g)} | Post rows: {treated_rows} ({treated_rows/len(g):.1%})")
 
         cohorts = g.loc[g["treated_ever"] == 1, ["unit_id", "g"]].drop_duplicates()
         cohort_counts = cohorts["g"].value_counts().sort_index()
 
         self.covar_cols_used = covar_cols_used
+        #raise Exception(cfg.__dict__.values())
         self.info = {
             "unit_level": unit_level,
             "n_sd_wide_cols": len(sd_wide_names),
@@ -682,13 +716,14 @@ class PanelData:
                 "scaler_path": pca_info.get("scaler_path"),
                 "model_path": pca_info.get("model_path"),
             },
+            
             "covs_scaler_path": covs_scaler_path,
             "dropped_units": dropped_units,
             "covariates_used": covar_cols_used,
             "emissions_outcome_mode_used": used_outcome_mode,
             "outcome_var": cfg.outcome_col,
             "differenced": cfg.differenced,
-            "use_lag_levels_in_diff": bool(getattr(cfg, "use_lag_levels_in_diff", True)),
+            "use_lag_levels_in_diff": bool(getattr(cfg, "use_lag_levels_in_diff", False)),
             "outcome_name": self.outcome_name,
             "dose_bin_support": dose_bin_support,
             "dose_bin_method": (dose_bin_support or {}).get("method"),

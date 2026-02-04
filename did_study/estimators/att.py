@@ -95,7 +95,43 @@ def estimate_att_o(
     except Exception:
         mde_val = float("nan")
 
-    result = AttResult(coef, se, p, np.nan, m, collapsed)
+    # Optional: Wild Cluster Bootstrap p-value for H0: treated_ever == 0
+    p_wcb = np.nan
+    if wcb_args:
+        try:
+            # Determine cluster spec
+            cluster_spec = (
+                wcb_args.get("cluster_spec")
+                or wcb_args.get("cluster_terms")
+                or [cluster_col]
+            )
+            if isinstance(cluster_spec, str):
+                cluster_list = [cluster_spec]
+            else:
+                cluster_list = list(cluster_spec or [cluster_col])
+            cluster_list = [c for c in cluster_list if c in collapsed.columns]
+            if not cluster_list:
+                cluster_list = [cluster_col]
+
+            runner = make_wcb_runner(
+                df=collapsed[["delta_y", "treated_ever", cluster_col]].copy(),
+                outcome="delta_y",
+                regressors=["treated_ever"],
+                fe=[],
+                cluster=cluster_list,
+                B=int(wcb_args.get("B", 9999)),
+                weights=str(wcb_args.get("weights", "rademacher")),
+                impose_null=bool(wcb_args.get("impose_null", True)),
+                seed=wcb_args.get("seed", None),
+            )
+            p_boot = runner.pvalue(TestSpec(param="treated_ever"))
+            if isinstance(p_boot, float):
+                p_wcb = float(p_boot)
+        except Exception:
+            # WCB not available (e.g., rpy2/R missing) -> keep NaN
+            p_wcb = np.nan
+
+    result = AttResult(coef, se, p, p_wcb, m, collapsed)
     result.n_clusters = n_clusters
     result.clusters = n_clusters
     result.n_obs = n_obs

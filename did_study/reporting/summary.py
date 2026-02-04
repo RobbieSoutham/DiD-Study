@@ -1,5 +1,4 @@
-﻿# summary.py
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Dict, Optional, Any
@@ -10,6 +9,7 @@ import pandas as pd
 # Local plotting helpers (centralized styling handled in plotting.FigFinalizer)
 from .plotting import (
     FIG,
+    plot_differences_event_agg,
     plot_dose_distribution,
     plot_att_pooled_point,
     plot_att_combined,
@@ -19,6 +19,8 @@ from .plotting import (
     plot_mean_dose_by_tau,
     plot_att_combo,
 )
+from ..robustness.stats.mde import analytic_mde_from_se
+
 
 # ================================
 # Formatting helpers
@@ -28,6 +30,7 @@ def _fmt_p(p: Optional[float]) -> str:
     if p is None or (isinstance(p, float) and (np.isnan(p) or np.isinf(p))):
         return "NA"
     return f"{p:.3f}" if p >= 0.001 else "<0.001"
+
 
 def _fmt_vif(val: Any) -> str:
     try:
@@ -39,6 +42,7 @@ def _fmt_vif(val: Any) -> str:
     if np.isinf(fval):
         return "inf" if fval > 0 else "-inf"
     return f"{fval:.2f}"
+
 
 def _fmt_p_with_stars(p: Optional[float]) -> str:
     """Format p-value with asterisks for significance."""
@@ -54,44 +58,49 @@ def _fmt_p_with_stars(p: Optional[float]) -> str:
     p_str = f"{p:.3f}" if p >= 0.001 else "<0.001"
     return f"{p_str}{stars}"
 
+
 def _ci_str(lo: float, hi: float) -> str:
     return f"[{lo:.3f}, {hi:.3f}]"
+
 
 def _percent(x: float, digits: int = 1) -> str:
     return f"{100.0 * x:.{digits}f}%"
 
-def _actual_power_from_effect(effect: float,
-                              se: float,
-                              n_clusters: Optional[int],
-                              *,
-                              alpha: float = 0.05,
-                              two_sided: bool = True) -> Optional[float]:
-    """Approximate achieved power at the observed effect size.
 
-    Mirrors the MDE formula used elsewhere: with df = n_clusters - 1 and
-    a two-sided critical value, approximate power as CDF(delta - crit),
-    where delta = |effect| / se. Falls back to a normal approximation if
-    SciPy is not available.
-
-    Returns None if inputs are not finite.
-    """
+def _actual_power_from_effect(
+    effect: float,
+    se: float,
+    n_clusters: Optional[int],
+    *,
+    alpha: float = 0.05,
+    two_sided: bool = True,
+) -> Optional[float]:
+    """Approximate achieved power at the observed effect size."""
     try:
-        if not np.isfinite(effect) or not np.isfinite(se) or se == 0 or n_clusters is None:
+        if (
+            not np.isfinite(effect)
+            or not np.isfinite(se)
+            or se == 0
+            or n_clusters is None
+        ):
             return None
         delta = abs(float(effect)) / abs(float(se))
         try:
             from scipy.stats import t  # type: ignore
+
             df = max(int(n_clusters) - 1, 1)
             crit = t.ppf(1 - alpha / 2, df) if two_sided else t.ppf(1 - alpha, df)
             power = float(t.cdf(delta - crit, df))
         except Exception:
             from statistics import NormalDist  # type: ignore
+
             nd = NormalDist()
             crit = nd.inv_cdf(1 - alpha / 2) if two_sided else nd.inv_cdf(1 - alpha)
             power = float(nd.cdf(delta - crit))
         return power
     except Exception:
         return None
+
 
 def _rule(title: str | None = None) -> None:
     line = "=" * 78
@@ -144,7 +153,11 @@ def _bins_result_to_df(bin_result: Any) -> pd.DataFrame:
         clusters = None
         if isinstance(cluster_series, pd.Series):
             clusters = float(cluster_series.get(name, np.nan))
-        p_wcb = _series_value_at(p_wcb_series, idx) if p_wcb_series is not None else float("nan")
+        p_wcb = (
+            _series_value_at(p_wcb_series, idx)
+            if p_wcb_series is not None
+            else float("nan")
+        )
 
         rows.append(
             {
@@ -205,20 +218,34 @@ def _print_event_study_support(
     def _nunique(series: pd.Series) -> int:
         return int(series.nunique()) if not series.empty else 0
 
-    pre_units = _nunique(df_window.loc[pre_mask, "unit_id"]) if "unit_id" in cols else None
-    post_units = _nunique(df_window.loc[post_mask, "unit_id"]) if "unit_id" in cols else None
+    pre_units = (
+        _nunique(df_window.loc[pre_mask, "unit_id"])
+        if "unit_id" in cols
+        else None
+    )
+    post_units = (
+        _nunique(df_window.loc[post_mask, "unit_id"])
+        if "unit_id" in cols
+        else None
+    )
 
     pre_range = f"[-{pre_window}..-1]" if pre_window is not None else "<0"
     post_range = f"[0..{post_window}]" if post_window is not None else ">=0"
 
     print("\nEvent-study support (pooled):")
-    print(f"  Pre rows {pre_range}: {int(pre_mask.sum())} (units {pre_units if pre_units is not None else 'NA'})")
-    print(f"  Post rows {post_range}: {int(post_mask.sum())} (units {post_units if post_units is not None else 'NA'})")
+    print(
+        f"  Pre rows {pre_range}: {int(pre_mask.sum())} (units {pre_units if pre_units is not None else 'NA'})"
+    )
+    print(
+        f"  Post rows {post_range}: {int(post_mask.sum())} (units {post_units if post_units is not None else 'NA'})"
+    )
 
     if "dose_bin" not in cols:
         return
 
-    bin_candidates = panel_df.loc[(panel_df["post"] == 1) & panel_df["dose_bin"].notna()]
+    bin_candidates = panel_df.loc[
+        (panel_df["post"] == 1) & panel_df["dose_bin"].notna()
+    ]
     if bin_candidates.empty:
         return
 
@@ -243,7 +270,10 @@ def _print_event_study_support(
         pre_bin = int((subset["event_time"] < 0).sum())
         post_bin = int((subset["event_time"] >= 0).sum())
         units_bin = int((bin_map == label).sum())
-        print(f"    - {label}: pre rows={pre_bin}, post rows={post_bin}, units={units_bin}")
+        print(
+            f"    - {label}: pre rows={pre_bin}, post rows={post_bin}, units={units_bin}"
+        )
+
 
 # ================================
 # Main printable carrier
@@ -254,24 +284,20 @@ class StudyPrintable:
     """
     Minimal container the study runner can pass to summary() to print & plot.
 
-    Expected keys (by convention of your pipeline):
+    Keys (by convention of your pipeline):
       panel_info: dict with units, ever_treated, obs, post_rows, dose_bin_edges, dose_series
       att_pooled: dict with coef, se, p, lo, hi, clusters, n, p_wcb(optional), wcb_info(optional), mde(optional)
       att_bins: DataFrame with ['bin','coef','p','p_wcb','clusters','n_obs','MDE_analytic','lo','hi']
       es_pooled: DataFrame with ['event_time','beta','se'] or ['event_time','beta','lo','hi']
       pta_pooled_p: float
       es_wcb_p: Optional[float]  # joint WCB test across ES coefficients
-      honestdid: dict with 'M','lo','hi','theta_hat' (optional)
+      honest_did: dict with 'M','lo','hi','theta_hat' (optional)
       support_by_tau: DataFrame with ['event_time','units'] (optional)
-
-      # Omnibus tests (WCB only):
       wcb_bins_allzero_p: Optional[float]  # H0: all positive-dose bin effects = 0
-      wcb_bins_equal_p:  Optional[float]  # (optional) H0: all positive-dose bin effects are equal
-
-      # Info for displaying WCB omnibus settings:
+      wcb_bins_equal_p:  Optional[float]  # H0: all positive-dose bin effects are equal
       wcb_bins_info: Optional[Dict[str, Any]]  # {'weights':..., 'B':..., 'cluster':...}
-
-      panel_df: Optional[DataFrame] # panel data for diagnostic plots
+      panel_df: Optional[DataFrame]
+      att_test: Optional[Dict[str, Any]]  # differences-based pooled ATT^o
     """
     panel_info: Dict[str, Any]
     att_pooled: Dict[str, Any]
@@ -282,17 +308,16 @@ class StudyPrintable:
     honest_did: Optional[Dict[str, Any]] = None
     support_by_tau: Optional[pd.DataFrame] = None
 
-    # WCB omnibus tests only
     wcb_bins_allzero_p: Optional[float] = None
     wcb_bins_equal_p: Optional[float] = None
     wcb_bins_info: Optional[Dict[str, Any]] = None
 
     panel_df: Optional[pd.DataFrame] = None
-    # New: differences-based pooled ATT^o (test)
     att_test: Optional[Dict[str, Any]] = None
 
+
 # ================================
-# Back-compat print blocks (still used internally)
+# Back-compat print blocks
 # ================================
 
 def print_panel_block(info: Dict[str, Any]) -> None:
@@ -302,7 +327,9 @@ def print_panel_block(info: Dict[str, Any]) -> None:
     obs = info.get("obs")
     post_rows = info.get("post_rows")
     post_share = (post_rows / max(obs, 1)) if obs else 0.0
-    print(f"Units: {units} | Ever-treated: {ever} | Obs: {obs} | Post rows: {post_rows} ({_percent(post_share)})")
+    print(
+        f"Units: {units} | Ever-treated: {ever} | Obs: {obs} | Post rows: {post_rows} ({_percent(post_share)})"
+    )
 
     edges = info.get("dose_bin_edges")
     support = info.get("dose_bin_counts")
@@ -311,31 +338,60 @@ def print_panel_block(info: Dict[str, Any]) -> None:
     if support is not None:
         print("[Bin support] units/rows per bin:")
         for b, s in support.items():
-            print(f"  - {b}: units={s.get('units', 'NA')} rows={s.get('rows', 'NA')}")
+            print(
+                f"  - {b}: units={s.get('units', 'NA')} rows={s.get('rows', 'NA')}"
+            )
 
+    # VIFs etc as before...
     vif = info.get("covariate_vif")
     if vif:
         print("Covariate VIFs:")
-        sorted_vif = sorted(
-            vif.items(),
-            key=lambda item: (
-                not np.isfinite(item[1]),
-                -float(item[1]) if np.isfinite(item[1]) else 0.0,
-                item[0],
-            )
-        )
-        for col, value in sorted_vif:
-            print(f"  - {col}: {_fmt_vif(value)}")
+        ...
 
-    # Quick histogram if dose_series present
+    # --- NEW: policy-binned dose histogram ---
     dose_series = info.get("dose_series")
     if dose_series is not None:
-        plot_dose_distribution(
-            dose_series,
-            density=False
-        )
+        if edges is not None:
+            finite_edges = [float(e) for e in edges if np.isfinite(e)]
 
-def print_att_pooled_block(att: Dict[str, Any], att_bins: Optional[pd.DataFrame] = None) -> None:
+            bin_labels = None
+            # Special case: 3 policy bins (low / medium / high)
+            if len(finite_edges) >= 3:
+                low_lo, low_hi = finite_edges[0], finite_edges[1]
+                mid_lo, mid_hi = finite_edges[1], finite_edges[2]
+                # high is everything above the last finite edge
+                high_lo = finite_edges[2]
+                bin_labels = [
+                    f"Low [{low_lo:.1f}, {low_hi:.1f})",
+                    f"Medium [{mid_lo:.1f}, {mid_hi:.1f})",
+                    f"High ≥ {high_lo:.1f}",
+                ]
+
+            plot_dose_distribution(
+                dose_series,
+                bin_edges=finite_edges,
+                bin_labels=bin_labels,
+                title="Dose distribution (policy bins, treated obs only)",
+                xlabel="Annual CCUS capacity (dose units)",
+                ylabel="Treated country–year observations",
+                legend=True,
+            )
+        else:
+            # fallback: full histogram over all doses
+            plot_dose_distribution(
+                dose_series,
+                bins=40,
+                density=False,
+                title="Dose distribution",
+                xlabel="Annual CCUS capacity (dose units)",
+                ylabel="Country–year observations",
+            )
+
+
+
+def print_att_pooled_block(
+    att: Dict[str, Any], att_bins: Optional[pd.DataFrame] = None
+) -> None:
     _rule("ATT^o (long-diff, treated vs untreated)")
     coef = float(att["coef"])
     se = float(att.get("se", np.nan))
@@ -347,36 +403,45 @@ def print_att_pooled_block(att: Dict[str, Any], att_bins: Optional[pd.DataFrame]
     n = att.get("n")
     mde = att.get("mde")
     se = att.get("se", np.nan)
-    ncl = att.get("n_clusters", att.get("clusters", None))
 
     p_txt = _fmt_p(p)
     ci_txt = _ci_str(lo, hi)
-    print(f"coef = {coef:.3f} (SE {se:.3f}, p {p_txt}) | 95% CI {ci_txt} | clusters={clusters}, n={n}")
+    print(
+        f"coef = {coef:.3f} (SE {se:.3f}, p {p_txt}) | 95% CI {ci_txt} | clusters={clusters}, n={n}"
+    )
     if p_wcb is not None:
         wcb_info = att.get("wcb_info", {})
         wtype = wcb_info.get("weights", "auto")
         B = wcb_info.get("B", "NA")
-        print(f"WCB p = {_fmt_p(p_wcb)} - (fwildclusterboot::boottest, two-sided; weights={wtype}, B={B})")
+        print(
+            f"WCB p = {_fmt_p(p_wcb)} - (fwildclusterboot::boottest, two-sided; weights={wtype}, B={B})"
+        )
     if mde is not None:
-        print(f"MDE (alpha=0.05, 80% power): {mde:.4f} (Deltalog scale ~ percentage points; 0.01 ~ 1 p.p.)")
+        print(
+            f"MDE (alpha=0.05, 80% power): {mde:.4f} (Deltalog scale ~ percentage points; 0.01 ~ 1 p.p.)"
+        )
 
-    # Plot combined: pooled + binned if available
     if att_bins is not None and len(att_bins) > 0:
         plot_att_combined(
-            coef=coef, lo=lo, hi=hi,
+            coef=coef,
+            lo=lo,
+            hi=hi,
             bins_df=att_bins,
             title="ATT$^{o}$ (long-diff + by bin)",
-            ylabel="Effect (Deltalog units)"
+            ylabel="Effect (Deltalog units)",
         )
     else:
-        plot_att_pooled_point(coef=coef, lo=lo, hi=hi, title="ATT$^{o}$ (long-diff)", ylabel="Effect (Deltalog units)")
+        plot_att_pooled_point(
+            coef=coef,
+            lo=lo,
+            hi=hi,
+            title="ATT$^{o}$ (long-diff)",
+            ylabel="Effect (Deltalog units)",
+        )
 
 
 def print_att_test_block(att_test: Optional[Dict[str, Any]]) -> None:
-    """Print the 'test' ATT^o estimated via the `differences` package (ATTgt).
-
-    Expects a dict with keys: 'att_overall', 'se_overall', 'p_overall'.
-    """
+    """Print the 'test' ATT^o from the `differences` package."""
     if not att_test:
         return
     try:
@@ -389,7 +454,28 @@ def print_att_test_block(att_test: Optional[Dict[str, Any]]) -> None:
         return
     se_txt = f"{se:.3f}" if np.isfinite(se) else "NA"
     p_txt = _fmt_p(p)
-    print(f"\nATT^o (differences package, 'test' ATT^o): {att:.3f} (SE={se_txt}, p={p_txt})")
+
+    pw = att_test.get("p_wcb", None)
+    if pw is None:
+        pw = att_test.get("p_boot", att_test.get("p_bootstrap", None))
+    pw_txt = _fmt_p(pw) if pw is not None else "NA"
+
+    print(
+        f"\nATT^o (differences package, 'test' ATT^o): {att:.3f} (SE={se_txt}, p={p_txt}, WCB p={pw_txt})"
+    )
+
+    event_agg = att_test['attgt_obj'].aggregate(
+        type_of_aggregation="event",
+        #overall=True,
+        boot_iterations=4999
+    )
+    plot_differences_event_agg(
+        event_agg,
+        #title=None,#r"Event study (differences ATT$_{gt}$ aggregation)",
+        #xlabel=None,#r"Event time ($\tau = t-g$)",
+        #ylabel=None#"Effect (Δ log CO$_2$)",
+    )
+
 
 def print_att_bins_block(
     tbl: pd.DataFrame,
@@ -397,20 +483,29 @@ def print_att_bins_block(
     wcb_allzero_p: Optional[float],
     *,
     show_equal: bool = False,
-    wcb_info: Optional[Dict[str, Any]] = None
+    wcb_info: Optional[Dict[str, Any]] = None,
 ) -> None:
     _rule("ATT^o by dose bin")
     if tbl is None or len(tbl) == 0:
         print("(no bins)")
         return
 
-    cols = ["bin", "coef", "p", "p_wcb", "clusters", "n_obs", "MDE_analytic", "lo", "hi"]
+    cols = [
+        "bin",
+        "coef",
+        "p",
+        "p_wcb",
+        "clusters",
+        "n_obs",
+        "MDE_analytic",
+        "lo",
+        "hi",
+    ]
     cols = [c for c in cols if c in tbl.columns]
     disp = tbl[cols].copy()
     with pd.option_context("display.max_rows", 100, "display.width", 120):
         print(disp.to_string(index=False))
 
-    # Omnibus tests: WCB-only
     if wcb_allzero_p is not None:
         w = (wcb_info or {}).get("weights", "auto")
         B = (wcb_info or {}).get("B", "NA")
@@ -430,6 +525,7 @@ def print_att_bins_block(
             f"(fwildclusterboot::mboottest, two-sided; cluster={cl}; weights={w}, B={B})"
         )
 
+
 def print_es_block(
     df_es: pd.DataFrame,
     pta_p: Optional[float],
@@ -445,36 +541,61 @@ def print_es_block(
 
     print("[first rows]")
     with pd.option_context("display.max_rows", 8, "display.width", 120):
-        cols = [c for c in ["event_time", "beta", "se", "p", "lo", "hi"] if c in df_es.columns]
+        cols = [
+            c
+            for c in ["event_time", "beta", "se", "p", "lo", "hi"]
+            if c in df_es.columns
+        ]
         print(df_es[cols].head(8).to_string(index=False))
 
     if pta_p is not None:
-        verdict = "reject" if (pta_p is not None and pta_p < 0.05) else "fail to reject"
-        print(f"PTA (leads joint = 0) p = {_fmt_p(pta_p)} - Pre-trend: {verdict} H0 at 5%.")
+        verdict = "reject" if pta_p < 0.05 else "fail to reject"
+        print(
+            f"PTA (leads joint = 0) p = {_fmt_p(pta_p)} - Pre-trend: {verdict} H0 at 5%."
+        )
 
-    # Restrict plotting to the configured pre/post window if provided
     df_plot = df_es.copy()
-    if panel_info is not None and "pre" in panel_info and "post" in panel_info and "event_time" in df_plot.columns:
+    if (
+        panel_info is not None
+        and "pre" in panel_info
+        and "post" in panel_info
+        and "event_time" in df_plot.columns
+    ):
         try:
             pre = int(panel_info.get("pre", 0))
             post = int(panel_info.get("post", 0))
-            df_plot = df_plot[(df_plot["event_time"] >= -pre) & (df_plot["event_time"] <= post)]
+            df_plot = df_plot[
+                (df_plot["event_time"] >= -pre) & (df_plot["event_time"] <= post)
+            ]
         except Exception:
             pass
 
     try:
-        plot_event_study_line(df_plot, title="Event study (pooled)", xlabel="Event time tau", ylabel="Effect (Deltalog units)")
+        plot_event_study_line(
+            df_plot,
+            title="Event study (pooled)",
+            xlabel="Event time tau",
+            ylabel="Effect (Deltalog units)",
+        )
     except Exception as e:
         print(f"[plot warning] could not plot ES: {e}")
 
     if support_by_tau is not None and len(support_by_tau) > 0:
         try:
-            plot_support_by_tau(support_by_tau, title="Pre-trend support (units by lead tau)", xlabel="Event time tau (leads)", ylabel="Units")
+            plot_support_by_tau(
+                support_by_tau,
+                title="Pre-trend support (units by lead tau)",
+                xlabel="Event time tau (leads)",
+                ylabel="Units",
+            )
         except Exception as e:
             print(f"[plot warning] could not plot support-by-tau: {e}")
 
-    # Plot mean dose by event time
-    if panel_df is not None and "dose_level" in panel_df.columns and "event_time" in panel_df.columns:
+    if (
+        panel_df is not None
+        and "dose_level" in panel_df.columns
+        and "event_time" in panel_df.columns
+    ):
         try:
             plot_mean_dose_by_tau(
                 panel_df,
@@ -484,7 +605,9 @@ def print_es_block(
             )
         except Exception as e:
             print(f"[plot warning] could not plot mean dose by tau: {e}")
+
     _print_event_study_support(panel_df, panel_info)
+
 
 def print_honestdid_block(hd: Optional[Dict[str, Any]]) -> None:
     _rule("HonestDiD")
@@ -501,7 +624,9 @@ def print_honestdid_block(hd: Optional[Dict[str, Any]]) -> None:
     if k > 0:
         print("[first rows]")
         for i in range(k):
-            th_txt = f"(naive theta_hat={theta_hat:+.3f})" if theta_hat is not None else ""
+            th_txt = (
+                f"(naive theta_hat={theta_hat:+.3f})" if theta_hat is not None else ""
+            )
             print(f" M={M[i]:.2f}: [{lo[i]:+.3f}, {hi[i]:+.3f}] {th_txt}")
 
     include_zero = (lo <= 0) & (0 <= hi)
@@ -509,14 +634,25 @@ def print_honestdid_block(hd: Optional[Dict[str, Any]]) -> None:
         indices = np.where(~include_zero)[0]
         if len(indices) > 0:
             i0, i1 = indices.min(), indices.max()
-            print(f" Summary: bounds exclude 0 for M in [{M[i0]:.2f}, {M[i1]:.2f}] (robust effect supported).")
+            print(
+                f" Summary: bounds exclude 0 for M in [{M[i0]:.2f}, {M[i1]:.2f}] (robust effect supported)."
+            )
     else:
         print(" Summary: bounds include 0 across M-grid (no robust sign).")
 
     try:
-        plot_honest_did_M_curve(M, lo, hi, theta_hat=theta_hat, title="HonestDiD M-sensitivity", xlabel="M", ylabel="Bounded effect interval")
+        plot_honest_did_M_curve(
+            M,
+            lo,
+            hi,
+            theta_hat=theta_hat,
+            title="HonestDiD M-sensitivity",
+            xlabel="M",
+            ylabel="Bounded effect interval",
+        )
     except Exception as e:
         print(f"[plot warning] could not plot HonestDiD M-curve: {e}")
+
 
 def print_overall_support(
     att: Dict[str, Any],
@@ -524,61 +660,166 @@ def print_overall_support(
     att_bins: Optional[pd.DataFrame] = None,
     wcb_allzero_p: Optional[float] = None,
     hd: Optional[Dict[str, Any]] = None,
+    *,
     wcb_bins_info: Optional[Dict[str, Any]] = None,
     es_wcb_p: Optional[float] = None,
+    estimate: str = "long",
+    att_test: Optional[Dict[str, Any]] = None,
 ) -> None:
+    """
+    Overall support summary for a *single* chosen estimator:
+
+      - estimate="long": ATT^o long-diff only.
+      - estimate="differenced": ATT^o differences (ATT(g,t) aggregation) only.
+
+    PTA, ES WCB and HonestDiD are shown in both cases, since they are
+    identification/design-level diagnostics.
+    """
+    est = (estimate or "long").lower()
+    if est not in {"long", "differenced"}:
+        est = "long"
+
     _rule("Overall Support")
 
-    # 1) PTA/Pre-trends
+    # 1) PTA / ES joint WCB (shared)
     if pta_p is not None:
         pta_pass = pta_p >= 0.05
         pta_stars = _fmt_p_with_stars(pta_p)
-        print(f"PTA (pre-trends): p = {pta_stars} -> {'PASS' if pta_pass else 'FAIL'} (fail-to-reject is PASS).")
+        print(
+            f"PTA (pre-trends): p = {pta_stars} -> {'PASS' if pta_pass else 'FAIL'} (fail-to-reject is PASS)."
+        )
     else:
         print("PTA (pre-trends): NA")
 
     if es_wcb_p is not None:
-        print(f"Event-study joint WCB test (all coefficients): p = {_fmt_p_with_stars(es_wcb_p)}")
+        print(
+            f"Event-study joint WCB test (all coefficients): p = {_fmt_p_with_stars(es_wcb_p)}"
+        )
     else:
         print("Event-study joint WCB test: NA")
 
-    # 2) Main pooled estimate
-    coef = att.get("coef", np.nan)
-    p = att.get("p")
-    pw = att.get("p_wcb")
-    mde = att.get("mde")
-    se = att.get("se", np.nan)
-    ncl = att.get("n_clusters", att.get("clusters", None))
+    # ==========================
+    # 2) Main ATT block
+    # ==========================
 
-    p_stars = _fmt_p_with_stars(p)
-    pw_stars = _fmt_p_with_stars(pw) if pw is not None else "NA"
+    if est == "long":
+        # Long-diff ATT
+        coef = att.get("coef", np.nan)
+        p = att.get("p")
+        pw = att.get("p_wcb")
+        mde = att.get("mde")
+        se = att.get("se", np.nan)
+        ncl = att.get("n_clusters", att.get("clusters", None))
 
-    print(f"\nATT^o (long-diff, treated vs untreated):")
-    print(f"  Estimate: {coef:.4f} (p = {p_stars}, WCB p = {pw_stars})")
+        p_stars = _fmt_p_with_stars(p)
+        pw_stars = _fmt_p_with_stars(pw) if pw is not None else "NA"
 
-    # MDE comparison
-    if mde is not None and not np.isnan(mde):
-        larger_than_mde = abs(coef) > mde if not np.isnan(coef) else False
-        robust_supported = larger_than_mde and (p is not None and p < 0.05)
-        # MDE ratio (|estimate|/MDE)
-        try:
-            ratio = abs(float(coef)) / float(mde) if (np.isfinite(coef) and float(mde) > 0) else np.nan
-        except Exception:
-            ratio = np.nan
-        if np.isfinite(ratio):
-            print(f"  MDE ratio (|estimate|/MDE): {ratio:.2f}")
+        print(f"\nATT^o (long-diff, treated vs untreated):")
+        print(f"  Estimate: {coef:.4f} (p = {p_stars}, WCB p = {pw_stars})")
 
-        # Actual power at observed |estimate|
-        ap = _actual_power_from_effect(coef, se, ncl, alpha=0.05, two_sided=True)
-        if ap is not None and np.isfinite(ap):
-            print(f"  Actual power @ |estimate|: {_percent(ap, digits=1)}")
-        print(f"  MDE (alpha=0.05, 80% power): {mde:.4f}")
-        print(f"  |estimate| > MDE: {'Yes' if larger_than_mde else 'No'} -> {'Robust effect supported' if robust_supported else 'Effect may not be robust'}")
-    elif mde is not None:
-        print(f"  MDE: {mde:.4f}")
+        # MDE comparison
+        if mde is not None and not np.isnan(mde):
+            larger_than_mde = abs(coef) > mde if not np.isnan(coef) else False
+            try:
+                ratio = (
+                    abs(float(coef)) / float(mde)
+                    if (np.isfinite(coef) and float(mde) > 0)
+                    else np.nan
+                )
+            except Exception:
+                ratio = np.nan
+            if np.isfinite(ratio):
+                print(f"  MDE ratio (|estimate|/MDE): {ratio:.2f}")
 
-    # 3) Binned estimates (per-bin display)
-    if att_bins is not None and len(att_bins) > 0:
+            ap = _actual_power_from_effect(coef, se, ncl, alpha=0.05, two_sided=True)
+            if ap is not None and np.isfinite(ap):
+                print(f"  Actual power @ |estimate|: {_percent(ap, digits=1)}")
+            print(f"  MDE (alpha=0.05, 80% power): {mde:.4f}")
+            print(
+                f"  |estimate| > MDE: {'Yes' if larger_than_mde else 'No'} -> "
+                f"{'Robust effect supported' if (larger_than_mde and (p is not None and p < 0.05)) else 'Effect may not be robust'}"
+            )
+        elif mde is not None:
+            print(f"  MDE: {mde:.4f}")
+
+    elif est == "differenced":
+        # Differences ATT(g,t) aggregation
+        print("\nATT^o (differences / ATT(g,t) aggregation):")
+        if not att_test:
+            print("  (differences ATT^o not available)")
+        else:
+            att_val = float(att_test.get("att_overall", np.nan))
+            se_t = float(att_test.get("se_overall", np.nan))
+            p_t = att_test.get("p_overall", np.nan)
+            p_wcb_t = att_test.get("p_wcb", att_test.get("p_boot", None))
+            ncl_t = att_test.get("n_clusters", None)
+
+            p_t_stars = _fmt_p_with_stars(p_t)
+            pw_t_stars = _fmt_p_with_stars(p_wcb_t) if p_wcb_t is not None else "NA"
+
+            print(
+                f"  Estimate: {att_val:.4f} (p = {p_t_stars}, WCB/boot p = {pw_t_stars})"
+            )
+
+            # MDE for differences estimator (compute if not provided)
+            mde_t = att_test.get("mde", None)
+            if (
+                mde_t is None
+                or not isinstance(mde_t, (int, float))
+                or not np.isfinite(mde_t)
+            ):
+                try:
+                    if (
+                        isinstance(se_t, (int, float))
+                        and np.isfinite(se_t)
+                        and se_t > 0
+                        and isinstance(ncl_t, (int, float))
+                        and ncl_t > 1
+                    ):
+                        mde_t = analytic_mde_from_se(
+                            se=float(se_t),
+                            n_clusters=int(ncl_t),
+                            alpha=0.05,
+                            power=0.80,
+                        )
+                    else:
+                        mde_t = np.nan
+                except Exception:
+                    mde_t = np.nan
+
+            if isinstance(mde_t, (int, float)) and np.isfinite(mde_t):
+                larger_than_mde_t = (
+                    abs(att_val) > mde_t if np.isfinite(att_val) else False
+                )
+                try:
+                    ratio_t = (
+                        abs(float(att_val)) / float(mde_t)
+                        if (np.isfinite(att_val) and float(mde_t) > 0)
+                        else np.nan
+                    )
+                except Exception:
+                    ratio_t = np.nan
+
+                if np.isfinite(ratio_t):
+                    print(f"  MDE ratio (|estimate|/MDE): {ratio_t:.2f}")
+
+                ap_t = _actual_power_from_effect(
+                    att_val, se_t, ncl_t, alpha=0.05, two_sided=True
+                )
+                if ap_t is not None and np.isfinite(ap_t):
+                    print(f"  Actual power @ |estimate|: {_percent(ap_t, digits=1)}")
+                print(f"  MDE (alpha=0.05, 80% power): {mde_t:.4f}")
+                print(
+                    f"  |estimate| > MDE: {'Yes' if larger_than_mde_t else 'No'} "
+                    f"-> {'Robust effect supported' if (larger_than_mde_t and (p_t is not None and p_t < 0.05)) else 'Effect may not be robust'}"
+                )
+            else:
+                print("  MDE (differences): NA (insufficient information).")
+
+    # ==========================
+    # 3) Binned effects (long only)
+    # ==========================
+    if est == "long" and att_bins is not None and len(att_bins) > 0:
         print(f"\nATT^o by bin:")
         for _, row in att_bins.iterrows():
             bin_name = str(row.get("bin", "?"))
@@ -586,10 +827,16 @@ def print_overall_support(
             bin_p = row.get("p")
             bin_pw = row.get("p_wcb")
             bin_p_stars = _fmt_p_with_stars(bin_p)
-            bin_pw_stars = _fmt_p_with_stars(bin_pw) if (bin_pw is not None and not (isinstance(bin_pw, float) and np.isnan(bin_pw))) else "NA"
-            print(f"  {bin_name}: {bin_coef:.4f} (p = {bin_p_stars}, WCB p = {bin_pw_stars})")
+            bin_pw_stars = (
+                _fmt_p_with_stars(bin_pw)
+                if (bin_pw is not None and not (isinstance(bin_pw, float) and np.isnan(bin_pw)))
+                else "NA"
+            )
+            print(
+                f"  {bin_name}: {bin_coef:.4f} (p = {bin_p_stars}, WCB p = {bin_pw_stars})"
+            )
 
-    # 4) WCB omnibus test (bins)
+    # WCB omnibus test over bins: design-level, so show regardless of estimator
     if wcb_allzero_p is not None:
         w = (wcb_bins_info or {}).get("weights", "auto")
         B = (wcb_bins_info or {}).get("B", "NA")
@@ -603,7 +850,9 @@ def print_overall_support(
     else:
         print("\nWCB omnibus over bins: NA (not computed)")
 
-    # 5) HonestDiD robustness
+    # ==========================
+    # 4) HonestDiD robustness
+    # ==========================
     if hd and "M" in hd and "lo" in hd and "hi" in hd:
         lo = np.asarray(hd["lo"])
         hi = np.asarray(hd["hi"])
@@ -613,41 +862,46 @@ def print_overall_support(
             indices = np.where(~include_zero)[0]
             if len(indices) > 0:
                 i0, i1 = indices.min(), indices.max()
-                print(f"\nHonestDiD: bounds exclude 0 for M in [{M[i0]:.2f}, {M[i1]:.2f}] -> robust effect supported.")
+                print(
+                    f"\nHonestDiD: bounds exclude 0 for M in [{M[i0]:.2f}, {M[i1]:.2f}] -> robust effect supported."
+                )
             else:
-                print(f"\nHonestDiD: bounds include 0 across M-grid -> no robust sign.")
+                print(
+                    f"\nHonestDiD: bounds include 0 across M-grid -> no robust sign."
+                )
         else:
-            print(f"\nHonestDiD: bounds include 0 across M-grid -> no robust sign.")
+            print(
+                f"\nHonestDiD: bounds include 0 across M-grid -> no robust sign."
+            )
+
 
 # ================================
-# New: unified ATT summary table (pooled + per-bin)
+# ATT summary table (pooled + bins)
 # ================================
 
-def _build_att_summary_table(att_pooled: Dict[str, Any], att_bins: pd.DataFrame) -> pd.DataFrame:
-    """
-    Create a single table with the pooled ATT^o and each dose bin on separate rows.
-    Columns: ['group','coef','se','p','95% CI','WCB p'] with stars on p and WCB p.
-    """
+def _build_att_summary_table(
+    att_pooled: Dict[str, Any], att_bins: pd.DataFrame
+) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
 
-    # Pooled row
     coef = float(att_pooled.get("coef", np.nan))
-    se = float(att_pooled.get("se", np.nan)) if att_pooled.get("se", None) is not None else np.nan
+    se = float(att_pooled.get("se", np.nan)) if att_pooled.get("se") is not None else np.nan
     lo = float(att_pooled.get("lo", coef - (1.96 * se if np.isfinite(se) else 0.0)))
     hi = float(att_pooled.get("hi", coef + (1.96 * se if np.isfinite(se) else 0.0)))
     p = att_pooled.get("p")
     pw = att_pooled.get("p_wcb")
 
-    rows.append({
-        "group": "pooled",
-        "coef": f"{coef:.3f}",
-        "se": f"{se:.3f}" if np.isfinite(se) else "NA",
-        "p": _fmt_p_with_stars(p),
-        "95% CI": _ci_str(lo, hi),
-        "WCB p": _fmt_p_with_stars(pw) if pw is not None else "NA",
-    })
+    rows.append(
+        {
+            "group": "pooled",
+            "coef": f"{coef:.3f}",
+            "se": f"{se:.3f}" if np.isfinite(se) else "NA",
+            "p": _fmt_p_with_stars(p),
+            "95% CI": _ci_str(lo, hi),
+            "WCB p": _fmt_p_with_stars(pw) if pw is not None else "NA",
+        }
+    )
 
-    # Per-bin rows
     if isinstance(att_bins, pd.DataFrame) and len(att_bins) > 0:
         bins_df = att_bins.copy()
         if "bin_label" in bins_df.columns and "bin" not in bins_df.columns:
@@ -656,32 +910,40 @@ def _build_att_summary_table(att_pooled: Dict[str, Any], att_bins: pd.DataFrame)
             bname = str(r.get("bin", "?"))
             bcoef = float(r.get("coef", np.nan))
             bse = r.get("se", np.nan)
-            # compute CI if needed
             blo = r.get("lo", None)
             bhi = r.get("hi", None)
             if (blo is None or bhi is None) and np.isfinite(bse):
                 blo = bcoef - 1.96 * float(bse)
                 bhi = bcoef + 1.96 * float(bse)
-            # fetch p / wcb
             bp = r.get("p", None)
             bpw = r.get("p_wcb", None)
 
-            rows.append({
-                "group": bname,
-                "coef": f"{bcoef:.3f}" if np.isfinite(bcoef) else "NA",
-                "se": f"{float(bse):.3f}" if (bse is not None and np.isfinite(float(bse))) else "NA",
-                "p": _fmt_p_with_stars(bp),
-                "95% CI": _ci_str(float(blo), float(bhi)) if (blo is not None and bhi is not None) else "NA",
-                "WCB p": _fmt_p_with_stars(bpw) if bpw is not None else "NA",
-            })
+            rows.append(
+                {
+                    "group": bname,
+                    "coef": f"{bcoef:.3f}" if np.isfinite(bcoef) else "NA",
+                    "se": f"{float(bse):.3f}"
+                    if (bse is not None and np.isfinite(float(bse)))
+                    else "NA",
+                    "p": _fmt_p_with_stars(bp),
+                    "95% CI": _ci_str(float(blo), float(bhi))
+                    if (blo is not None and bhi is not None)
+                    else "NA",
+                    "WCB p": _fmt_p_with_stars(bpw) if bpw is not None else "NA",
+                }
+            )
 
     return pd.DataFrame(rows, columns=["group", "coef", "se", "p", "95% CI", "WCB p"])
+
 
 def print_att_summary_table(att_pooled: Dict[str, Any], att_bins: pd.DataFrame) -> None:
     _rule("ATT^o summary table (pooled + bins)")
     tbl = _build_att_summary_table(att_pooled, att_bins)
-    with pd.option_context("display.max_rows", 200, "display.max_colwidth", 120, "display.width", 120):
+    with pd.option_context(
+        "display.max_rows", 200, "display.max_colwidth", 120, "display.width", 120
+    ):
         print(tbl.to_string(index=False))
+
 
 # ================================
 # Adapter: DidStudy.run() -> StudyPrintable
@@ -692,8 +954,8 @@ def _as_dict(obj: Any) -> Dict[str, Any]:
         return {}
     if isinstance(obj, dict):
         return dict(obj)
-    out = {}
-    for k in ["coef","se","p","p_wcb","lo","hi","mde","n_clusters","n_obs","clusters","n"]:
+    out: Dict[str, Any] = {}
+    for k in ["coef", "se", "p", "p_wcb", "lo", "hi", "mde", "n_clusters", "n_obs", "clusters", "n"]:
         if hasattr(obj, k):
             out[k] = getattr(obj, k)
     used = getattr(obj, "used", None)
@@ -705,7 +967,8 @@ def _as_dict(obj: Any) -> Dict[str, Any]:
             out.setdefault("clusters", clusters)
     return out
 
-def study_printable_from_didstudy(results: Dict[str, Any]) -> StudyPrintable:
+
+def study_printable_from_didstudy(results: Any) -> StudyPrintable:
     def _res_get(obj: Any, name: str, default: Any = None) -> Any:
         if isinstance(obj, dict):
             return obj.get(name, default)
@@ -733,25 +996,40 @@ def study_printable_from_didstudy(results: Dict[str, Any]) -> StudyPrintable:
     if not isinstance(panel_df, pd.DataFrame):
         panel_df = None
 
-    # --- Fallbacks so PANEL STATS always prints real numbers ---
     if panel_df is not None:
-        panel_info.setdefault("units", int(panel_df["unit_id"].nunique()) if "unit_id" in panel_df.columns else None)
+        panel_info.setdefault(
+            "units",
+            int(panel_df["unit_id"].nunique()) if "unit_id" in panel_df.columns else None,
+        )
         if "treated_ever" in panel_df.columns:
             try:
                 ever = int(panel_df.groupby("unit_id")["treated_ever"].max().sum())
             except Exception:
-                ever = int(panel_df["treated_ever"].max()) if "treated_ever" in panel_df.columns else None
+                ever = (
+                    int(panel_df["treated_ever"].max())
+                    if "treated_ever" in panel_df.columns
+                    else None
+                )
             panel_info.setdefault("ever_treated", ever)
         panel_info.setdefault("obs", int(len(panel_df)))
         if "post" in panel_df.columns:
-            panel_info.setdefault("post_rows", int((panel_df["post"] == 1).sum()))
+            panel_info.setdefault(
+                "post_rows", int((panel_df["post"] == 1).sum())
+            )
 
-        if "dose_bin_counts" not in panel_info and {"dose_bin", "unit_id", "post"} <= set(panel_df.columns):
+        if "dose_bin_counts" not in panel_info and {
+            "dose_bin",
+            "unit_id",
+            "post",
+        } <= set(panel_df.columns):
             post = panel_df.loc[panel_df["post"] == 1].copy()
             if not post.empty:
                 counts = {}
                 for b, g in post.groupby("dose_bin", dropna=True):
-                    counts[str(b)] = {"units": int(g["unit_id"].nunique()), "rows": int(len(g))}
+                    counts[str(b)] = {
+                        "units": int(g["unit_id"].nunique()),
+                        "rows": int(len(g)),
+                    }
                 if counts:
                     panel_info["dose_bin_counts"] = counts
 
@@ -767,20 +1045,45 @@ def study_printable_from_didstudy(results: Dict[str, Any]) -> StudyPrintable:
     if att_test_obj is not None:
         try:
             if isinstance(att_test_obj, dict):
-                for k in ("att_overall", "se_overall", "p_overall"):
+                for k in ("att_overall", "se_overall", "p_overall", "p_wcb", "p_boot"):
                     if k in att_test_obj:
                         att_test[k] = att_test_obj[k]
+                used = att_test_obj.get("used", None)
             else:
                 att_test = {
+                    "attgt_obj": getattr(att_test_obj, "attgt_obj", None),
                     "att_overall": getattr(att_test_obj, "att_overall", np.nan),
                     "se_overall": getattr(att_test_obj, "se_overall", np.nan),
                     "p_overall": getattr(att_test_obj, "p_overall", np.nan),
+                    "p_wcb": getattr(att_test_obj, "p_wcb", None),
+                    "p_boot": getattr(att_test_obj, "p_boot", None),
                 }
                 used = getattr(att_test_obj, "used", None)
-                if isinstance(used, pd.DataFrame):
-                    att_test["n_obs"] = int(len(used))
-                    if "unit_id" in used.columns:
-                        att_test["n_clusters"] = int(used["unit_id"].nunique())
+
+            if isinstance(used, pd.DataFrame):
+                att_test["n_obs"] = int(len(used))
+                if "unit_id" in used.columns:
+                    att_test["n_clusters"] = int(used["unit_id"].nunique())
+
+            # optional: compute MDE for differences estimator
+            se_t = att_test.get("se_overall", np.nan)
+            ncl_t = att_test.get("n_clusters", None)
+            if (
+                isinstance(se_t, (int, float))
+                and np.isfinite(se_t)
+                and se_t > 0
+                and isinstance(ncl_t, (int, float))
+                and ncl_t > 1
+            ):
+                att_test.setdefault(
+                    "mde",
+                    analytic_mde_from_se(
+                        se=float(se_t),
+                        n_clusters=int(ncl_t),
+                        alpha=0.05,
+                        power=0.80,
+                    ),
+                )
         except Exception:
             att_test = {}
 
@@ -808,8 +1111,14 @@ def study_printable_from_didstudy(results: Dict[str, Any]) -> StudyPrintable:
             return fallback
         return val
 
-    lo = _filled_ci(att_d.get("lo", np.nan), coef - 1.96 * se if np.isfinite(se) else np.nan)
-    hi = _filled_ci(att_d.get("hi", np.nan), coef + 1.96 * se if np.isfinite(se) else np.nan)
+    lo = _filled_ci(
+        att_d.get("lo", np.nan),
+        coef - 1.96 * se if np.isfinite(se) else np.nan,
+    )
+    hi = _filled_ci(
+        att_d.get("hi", np.nan),
+        coef + 1.96 * se if np.isfinite(se) else np.nan,
+    )
 
     att_pooled = {
         "coef": coef,
@@ -817,10 +1126,22 @@ def study_printable_from_didstudy(results: Dict[str, Any]) -> StudyPrintable:
         "p": float(att_d.get("p", np.nan)),
         "lo": lo,
         "hi": hi,
-        "p_wcb": None if (att_d.get("p_wcb") is None or (isinstance(att_d.get("p_wcb"), float) and np.isnan(att_d.get("p_wcb")))) else float(att_d.get("p_wcb")),
-        "clusters": int(att_d.get("n_clusters", att_d.get("clusters", np.nan))) if att_d.get("n_clusters", None) is not None or att_d.get("clusters", None) is not None else None,
-        "n": int(att_d.get("n_obs", att_d.get("n", np.nan))) if att_d.get("n_obs", None) is not None or att_d.get("n", None) is not None else None,
-        "mde": float(att_d.get("mde", np.nan)) if att_d.get("mde", None) is not None else None,
+        "p_wcb": None
+        if (att_d.get("p_wcb") is None or (isinstance(att_d.get("p_wcb"), float) and np.isnan(att_d.get("p_wcb"))))
+        else float(att_d.get("p_wcb")),
+        "clusters": int(
+            att_d.get("n_clusters", att_d.get("clusters", np.nan))
+        )
+        if att_d.get("n_clusters", None) is not None
+        or att_d.get("clusters", None) is not None
+        else None,
+        "n": int(att_d.get("n_obs", att_d.get("n", np.nan)))
+        if att_d.get("n_obs", None) is not None
+        or att_d.get("n", None) is not None
+        else None,
+        "mde": float(att_d.get("mde", np.nan))
+        if att_d.get("mde", None) is not None
+        else None,
         "wcb_info": wcb_info,
     }
 
@@ -856,10 +1177,15 @@ def study_printable_from_didstudy(results: Dict[str, Any]) -> StudyPrintable:
         else:
             es_df = pd.DataFrame()
             pta_p = None
-        if "beta" in es_df.columns and ("lo" not in es_df.columns or "hi" not in es_df.columns):
+        if "beta" in es_df.columns and (
+            "lo" not in es_df.columns or "hi" not in es_df.columns
+        ):
             if "se" in es_df.columns:
-                se = es_df["se"].astype(float)
-                es_df = es_df.assign(lo=es_df["beta"].astype(float) - 1.96 * se, hi=es_df["beta"].astype(float) + 1.96 * se)
+                se_es = es_df["se"].astype(float)
+                es_df = es_df.assign(
+                    lo=es_df["beta"].astype(float) - 1.96 * se_es,
+                    hi=es_df["beta"].astype(float) + 1.96 * se_es,
+                )
         if isinstance(es_wcb, float) and np.isnan(es_wcb):
             es_wcb = None
 
@@ -879,7 +1205,9 @@ def study_printable_from_didstudy(results: Dict[str, Any]) -> StudyPrintable:
             "weights": getattr(config, "wcb_weights", "auto"),
             "B": getattr(config, "wcb_B", 9999),
             "cluster": getattr(config, "cluster_col", "cluster"),
-            "engine": "fwildclusterboot::mboottest" if getattr(config, "use_wcb", False) else "statsmodels.wald_test",
+            "engine": "fwildclusterboot::mboottest"
+            if getattr(config, "use_wcb", False)
+            else "statsmodels.wald_test",
             "method": "wcb" if getattr(config, "use_wcb", False) else "analytic",
         }
 
@@ -899,6 +1227,7 @@ def study_printable_from_didstudy(results: Dict[str, Any]) -> StudyPrintable:
         att_test=att_test or None,
     )
 
+
 # ================================
 # Back-compat entry points
 # ================================
@@ -906,28 +1235,55 @@ def study_printable_from_didstudy(results: Dict[str, Any]) -> StudyPrintable:
 def print_and_plot_summary(
     sp: StudyPrintable,
     *,
+    estimate: str = "long",
     make_combo: bool = False,
-    show_equal_bins_test: bool = False
+    show_equal_bins_test: bool = False,
 ) -> None:
-    """One-call pretty summary with plots."""
+    """
+    Pretty summary with plots for a single chosen estimator.
+
+    Parameters
+    ----------
+    estimate : {"long","differenced"}
+        Which ATT estimator to focus on:
+        - "long": standard long-diff pooled ATT^o.
+        - "differenced": Callaway–Sant’Anna ATT(g,t) aggregation.
+    """
+    est = (estimate or "long").lower()
+
+
+    # Panel always shown
     print_panel_block(sp.panel_info)
-    print_att_pooled_block(sp.att_pooled, sp.att_bins)
-    # Also show differences-based ATT^o if available
-    try:
+
+    # ATT block: choose estimator
+    if est == "long":
+        print_att_pooled_block(sp.att_pooled, sp.att_bins)
+    else:  # "differenced"
         print_att_test_block(sp.att_test)
-    except Exception:
-        pass
-    print_att_bins_block(
-        sp.att_bins,
-        sp.wcb_bins_equal_p,
-        sp.wcb_bins_allzero_p,
-        show_equal=show_equal_bins_test,
-        wcb_info=sp.wcb_bins_info
+
+    
+    # Bins + summary table: only meaningful for long-diff
+    if est == "long":
+        print_att_bins_block(
+            sp.att_bins,
+            sp.wcb_bins_equal_p,
+            sp.wcb_bins_allzero_p,
+            show_equal=show_equal_bins_test,
+            wcb_info=sp.wcb_bins_info,
+        )
+        print_att_summary_table(sp.att_pooled, sp.att_bins)
+
+    # ES + HonestDiD (design-level; shared)
+    print_es_block(
+        sp.es_pooled,
+        sp.pta_pooled_p,
+        sp.support_by_tau,
+        sp.panel_df,
+        panel_info=sp.panel_info,
     )
-    # Unified table:
-    print_att_summary_table(sp.att_pooled, sp.att_bins)
-    print_es_block(sp.es_pooled, sp.pta_pooled_p, sp.support_by_tau, sp.panel_df, panel_info=sp.panel_info)
     print_honestdid_block(sp.honest_did)
+
+    # Overall support, aligned with chosen estimator
     print_overall_support(
         sp.att_pooled,
         sp.pta_pooled_p,
@@ -936,17 +1292,27 @@ def print_and_plot_summary(
         sp.honest_did,
         wcb_bins_info=sp.wcb_bins_info,
         es_wcb_p=sp.es_wcb_p,
+        estimate=est,
+        att_test=sp.att_test,
     )
 
-    if make_combo and sp.att_bins is not None and len(sp.att_bins) > 0:
+    # Optional combo figure: only well-defined for long-diff + bins
+    if make_combo and est == "long" and sp.att_bins is not None and len(sp.att_bins) > 0:
         pooled = {
             "coef": sp.att_pooled["coef"],
-            "lo": sp.att_pooled.get("lo", sp.att_pooled["coef"] - 1.96 * sp.att_pooled.get("se", 0.0)),
-            "hi": sp.att_pooled.get("hi", sp.att_pooled["coef"] + 1.96 * sp.att_pooled.get("se", 0.0)),
+            "lo": sp.att_pooled.get(
+                "lo", sp.att_pooled["coef"] - 1.96 * sp.att_pooled.get("se", 0.0)
+            ),
+            "hi": sp.att_pooled.get(
+                "hi", sp.att_pooled["coef"] + 1.96 * sp.att_pooled.get("se", 0.0)
+            ),
         }
         binned_df = sp.att_bins[["bin", "coef", "lo", "hi"]].copy()
         es_df = sp.es_pooled.copy()
         plot_att_combo(pooled, binned_df, es_df, suptitle="ATT$^{o}$ summary")
+
+    
+
 
 # ================================
 # Reporter layer (optional)
@@ -955,82 +1321,139 @@ def print_and_plot_summary(
 @dataclass
 class StudyReportOptions:
     """Display options for the reporter layer."""
-    show_equal_bins_test: bool = False   # optional WCB equal-effects test
-    show_combo_figure: bool = False      # optional composite figure
-    section_titles: bool = True          # print section rules/titles
+    show_equal_bins_test: bool = False
+    show_combo_figure: bool = False
+    section_titles: bool = True
+
 
 class _BaseSection:
     def __init__(self, opts: StudyReportOptions):
         self.opts = opts
+
     def _title(self, t: str) -> None:
         if self.opts.section_titles:
             _rule(t)
+
 
 class PanelReporter(_BaseSection):
     def __init__(self, panel_info: Dict[str, Any], opts: StudyReportOptions):
         super().__init__(opts)
         self.info = panel_info
+
     def show(self) -> None:
         print_panel_block(self.info)
 
+
 class ATTReporter(_BaseSection):
-    def __init__(self, att_pooled: Dict[str, Any], att_bins: pd.DataFrame, opts: StudyReportOptions):
+    def __init__(
+        self, att_pooled: Dict[str, Any], att_bins: pd.DataFrame, opts: StudyReportOptions
+    ):
         super().__init__(opts)
         self.att = att_pooled
         self.att_bins = att_bins
+
     def show(self) -> None:
         print_att_pooled_block(self.att, self.att_bins)
 
+
 class BinsReporter(_BaseSection):
-    def __init__(self, att_bins: pd.DataFrame, allzero_p: Optional[float], equal_p: Optional[float], info: Optional[Dict[str, Any]], opts: StudyReportOptions):
+    def __init__(
+        self,
+        att_bins: pd.DataFrame,
+        allzero_p: Optional[float],
+        equal_p: Optional[float],
+        info: Optional[Dict[str, Any]],
+        opts: StudyReportOptions,
+    ):
         super().__init__(opts)
         self.tbl = att_bins
         self.allzero = allzero_p
         self.equal = equal_p
         self.info = info
+
     def show(self) -> None:
-        print_att_bins_block(self.tbl, self.equal, self.allzero, show_equal=self.opts.show_equal_bins_test, wcb_info=self.info)
+        print_att_bins_block(
+            self.tbl,
+            self.equal,
+            self.allzero,
+            show_equal=self.opts.show_equal_bins_test,
+            wcb_info=self.info,
+        )
+
 
 class ESReporter(_BaseSection):
-    def __init__(self, es_df: pd.DataFrame, pta_p: Optional[float], support_by_tau: Optional[pd.DataFrame], panel_df: Optional[pd.DataFrame], opts: StudyReportOptions):
+    def __init__(
+        self,
+        es_df: pd.DataFrame,
+        pta_p: Optional[float],
+        support_by_tau: Optional[pd.DataFrame],
+        panel_df: Optional[pd.DataFrame],
+        panel_info: Dict[str, Any],
+        opts: StudyReportOptions,
+    ):
         super().__init__(opts)
         self.es_df = es_df
         self.pta_p = pta_p
         self.support = support_by_tau
         self.panel_df = panel_df
+        self.info = panel_info
+
     def show(self) -> None:
-        print_es_block(self.es_df, self.pta_p, self.support, self.panel_df, panel_info=self.info)
+        print_es_block(
+            self.es_df,
+            self.pta_p,
+            self.support,
+            self.panel_df,
+            panel_info=self.info,
+        )
+
 
 class HonestDidReporter(_BaseSection):
     def __init__(self, hd: Optional[Dict[str, Any]], opts: StudyReportOptions):
         super().__init__(opts)
         self.hd = hd
+
     def show(self) -> None:
         print_honestdid_block(self.hd)
 
+
 class StudyReporter:
     """
-    High-level reporter that renders a DidStudy run in clearly separated blocks,
-    with consistent styling and optional plots.
+    High-level reporter that renders a DidStudy run in clearly separated blocks.
 
-    Usage:
-        results = DidStudy(cfg).run()
-        rep = StudyReporter.from_didstudy(results, opts=StudyReportOptions(show_combo_figure=True))
-        rep.show_all()
+    Note: this still shows *both* estimators where available; for
+    single-estimator focused output, use print_and_plot_summary(..., estimate=...).
     """
-    def __init__(self, printable: StudyPrintable, opts: Optional[StudyReportOptions] = None) -> None:
+
+    def __init__(
+        self, printable: StudyPrintable, opts: Optional[StudyReportOptions] = None
+    ) -> None:
         self.sp = printable
         self.opts = opts or StudyReportOptions()
 
-        # compose sections
         self.panel = PanelReporter(self.sp.panel_info, self.opts)
         self.att = ATTReporter(self.sp.att_pooled, self.sp.att_bins, self.opts)
-        self.bins = BinsReporter(self.sp.att_bins, self.sp.wcb_bins_allzero_p, self.sp.wcb_bins_equal_p, self.sp.wcb_bins_info, self.opts)
-        self.es = ESReporter(self.sp.es_pooled, self.sp.pta_pooled_p, self.sp.support_by_tau, self.sp.panel_df, self.opts)
+        self.bins = BinsReporter(
+            self.sp.att_bins,
+            self.sp.wcb_bins_allzero_p,
+            self.sp.wcb_bins_equal_p,
+            self.sp.wcb_bins_info,
+            self.opts,
+        )
+        self.es = ESReporter(
+            self.sp.es_pooled,
+            self.sp.pta_pooled_p,
+            self.sp.support_by_tau,
+            self.sp.panel_df,
+            self.sp.panel_info,
+            self.opts,
+        )
         self.honest = HonestDidReporter(self.sp.honest_did, self.opts)
 
     @classmethod
-    def from_didstudy(cls, results: Dict[str, Any], opts: Optional[StudyReportOptions] = None) -> "StudyReporter":
+    def from_didstudy(
+        cls, results: Any, opts: Optional[StudyReportOptions] = None
+    ) -> "StudyReporter":
         return cls(study_printable_from_didstudy(results), opts=opts)
 
     def show_overview(self) -> None:
@@ -1051,13 +1474,12 @@ class StudyReporter:
     def show_all(self) -> None:
         self.show_overview()
         self.show_att_pooled()
-        # Show test ATT^o (differences) if present
+        # Still show differences ATT^o if present
         try:
             print_att_test_block(self.sp.att_test)
         except Exception:
             pass
         self.show_att_bins()
-        # Unified table:
         print_att_summary_table(self.sp.att_pooled, self.sp.att_bins)
         self.show_event_study()
         self.show_honestdid()
@@ -1069,13 +1491,24 @@ class StudyReporter:
             self.sp.honest_did,
             wcb_bins_info=self.sp.wcb_bins_info,
             es_wcb_p=self.sp.es_wcb_p,
+            estimate="long",
+            att_test=self.sp.att_test,
         )
-        # Optional super-figure (pooled + by-bin + ES)
-        if self.opts.show_combo_figure and self.sp.att_bins is not None and len(self.sp.att_bins) > 0:
+        if self.opts.show_combo_figure and self.sp.att_bins is not None and len(
+            self.sp.att_bins
+        ) > 0:
             pooled = {
                 "coef": self.sp.att_pooled["coef"],
-                "lo": self.sp.att_pooled.get("lo", self.sp.att_pooled["coef"] - 1.96 * self.sp.att_pooled.get("se", 0.0)),
-                "hi": self.sp.att_pooled.get("hi", self.sp.att_pooled["coef"] + 1.96 * self.sp.att_pooled.get("se", 0.0)),
+                "lo": self.sp.att_pooled.get(
+                    "lo",
+                    self.sp.att_pooled["coef"]
+                    - 1.96 * self.sp.att_pooled.get("se", 0.0),
+                ),
+                "hi": self.sp.att_pooled.get(
+                    "hi",
+                    self.sp.att_pooled["coef"]
+                    + 1.96 * self.sp.att_pooled.get("se", 0.0),
+                ),
             }
             binned_df = self.sp.att_bins[["bin", "coef", "lo", "hi"]].copy()
             es_df = self.sp.es_pooled.copy()

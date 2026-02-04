@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import numpy as np
+
 try:  # Optional, only needed for pretty-printing
     import pandas as pd  # type: ignore
 except Exception:  # pragma: no cover - pandas always available in runtime
@@ -133,4 +135,130 @@ def log_wcb_call(
     print(line + "\n")
 
 
-__all__.append("log_wcb_call")
+def tidy_differences_event_agg_df(df_event: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize a `differences.ATTgt.aggregate('event')` result (or its CSV export)
+    into a tidy DataFrame with columns: ['event_time', 'beta', 'se', 'lo', 'hi'].
+
+    Handles:
+      - The in-memory result from `att_gt.aggregate('event', boot_iterations=...)`
+        with MultiIndex columns and `relative_period` as an index level.
+      - CSV exports like test.csv, where pandas writes stacked header rows.
+    """
+    df = df_event.copy()
+
+    # ---------- Case 1: CSV export like test.csv (stacked header) ----------
+    # Detect by an "Unnamed: 0" column + a 'relative_period' marker on row 2.
+    if (
+        isinstance(df.columns[0], str)
+        and df.columns[0].startswith("Unnamed")
+        and df.shape[0] >= 3
+        and str(df.iloc[2, 0]).lower() == "relative_period"
+    ):
+        # Data rows start at index 3; first column holds relative_period values.
+        data = df.iloc[3:].copy()
+
+        # Row 1 encodes ATT / std_error / lower / upper / zero_not_in_cband.
+        header1 = df.iloc[1].tolist()
+
+        # Build new column names: first is 'relative_period', then from header1.
+        col_names = ["relative_period"]
+        for i in range(1, len(data.columns)):
+            h = header1[i]
+            if isinstance(h, str) and h == h:
+                col_names.append(h)
+            else:
+                col_names.append(f"col_{i}")
+        data.columns = col_names
+
+        # Recurse: next pass treats this as a "normal" event-agg frame.
+        return tidy_differences_event_agg_df(data)
+
+    # ---------- Case 2: in-memory event_agg DataFrame ----------
+    # Flatten columns (works for simple and MultiIndex columns).
+    col_tuples = []
+    for col in df.columns:
+        if isinstance(col, tuple):
+            col_tuples.append(tuple(str(c) for c in col))
+        else:
+            col_tuples.append((str(col),))
+
+    # Map last-level name (lower-case) -> column index (first occurrence wins).
+    last_map: dict[str, int] = {}
+    for idx, tup in enumerate(col_tuples):
+        last = tup[-1].lower()
+        if last not in last_map:
+            last_map[last] = idx
+
+    def _get_col(last_name_candidates):
+        """Return the first column whose final level matches any of the candidates."""
+        for key in last_name_candidates:
+            idx = last_map.get(key)
+            if idx is not None:
+                return df.iloc[:, idx]
+        return None
+
+    # --- Event time (relative period) ---
+    # Try as a column first.
+    event_series = _get_col(["relative_period", "event_time", "tau"])
+
+    # If not found as column, fall back to index.
+    if event_series is None:
+        idx = df.index
+        if isinstance(idx, pd.MultiIndex):
+            names = [(name.lower() if isinstance(name, str) else "") for name in idx.names]
+            if "relative_period" in names:
+                level = names.index("relative_period")
+                event_series = pd.Index(idx.get_level_values(level))
+        else:
+            if isinstance(idx.name, str) and idx.name.lower() in ("relative_period", "event_time", "tau"):
+                event_series = pd.Series(idx)
+
+    if event_series is None:
+        raise ValueError(
+            "Could not find event-time information (relative_period / event_time / tau) "
+            "in either columns or index."
+        )
+
+    # --- ATT / effect ---
+    att_series = _get_col(["att", "estimate", "effect", "coef"])
+    if att_series is None:
+        raise ValueError(
+            "Could not find ATT/effect column in event aggregation "
+            "(ATT / estimate / effect / coef)."
+        )
+
+    # --- SE and CI bounds ---
+    se_series = _get_col(["std_error", "std.error", "se"])
+    lo_series = _get_col(["lower", "lb", "ci_lower"])
+    hi_series = _get_col(["upper", "ub", "ci_upper"])
+
+    # Use numpy arrays to avoid index-alignment surprises.
+    evt_vals = pd.to_numeric(np.asarray(event_series), errors="coerce")
+    att_vals = pd.to_numeric(np.asarray(att_series), errors="coerce")
+
+    out = pd.DataFrame()
+    out["event_time"] = evt_vals
+    out["beta"] = att_vals
+
+    if se_series is not None:
+        se_vals = pd.to_numeric(np.asarray(se_series), errors="coerce")
+        out["se"] = se_vals
+    else:
+        out["se"] = np.nan
+
+    if lo_series is not None and hi_series is not None:
+        lo_vals = pd.to_numeric(np.asarray(lo_series), errors="coerce")
+        hi_vals = pd.to_numeric(np.asarray(hi_series), errors="coerce")
+        out["lo"] = lo_vals
+        out["hi"] = hi_vals
+    elif se_series is not None:
+        out["lo"] = out["beta"] - 1.96 * out["se"]
+        out["hi"] = out["beta"] + 1.96 * out["se"]
+    else:
+        out["lo"] = np.nan
+        out["hi"] = np.nan
+
+    out = out.dropna(subset=["event_time", "beta"])
+    out = out.sort_values("event_time").reset_index(drop=True)
+    return out

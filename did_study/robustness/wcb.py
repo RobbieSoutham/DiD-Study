@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Optional, Sequence
+import os
 
 import numpy as np
 import pandas as pd
@@ -12,6 +13,8 @@ from .r_interface import (
     boottest_fixest,
     mboottest_fixest,
 )
+
+_WCB_VERBOSE = str(os.environ.get("DID_STUDY_WCB_VERBOSE", "0")).lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass
@@ -67,6 +70,8 @@ class WildClusterBootstrap:
 
     def _print_header(self, test_spec: TestSpec) -> None:
         """Debug print of the current WCB call."""
+        if not _WCB_VERBOSE:
+            return
         kind = "boottest_fixest"
         if test_spec.joint_zero:
             kind = "mboottest_fixest"

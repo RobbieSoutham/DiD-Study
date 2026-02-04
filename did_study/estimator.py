@@ -64,8 +64,8 @@ class DidEstimator(BaseEstimator):
     # ---------------------------------------------------------
     # ATT^o via `differences` (Callaway–Sant'Anna ATTgt)
     # ---------------------------------------------------------
-    def estimate_att_o_differences(self, panel: PanelData) -> DifferencesAttResult:
-        return estimate_att_o_differences(panel=panel, config=self.config)
+    def estimate_att_o_differences(self, panel: PanelData, *, wcb_args: Optional[Dict[str, Any]] = None) -> DifferencesAttResult:
+        return estimate_att_o_differences(panel=panel, config=self.config, wcb_args=wcb_args)
 
     # ---------------------------------------------------------
     # Event study by *dose bin*

@@ -10,7 +10,7 @@ from rpy2.robjects import pandas2ri
 from rpy2.robjects.conversion import localconverter
 from rpy2.robjects.vectors import FloatVector
 from rpy2.robjects.packages import importr
-
+from pandas.api.types import is_numeric_dtype
 
 # ---------------------------------------------------------------------
 # Small utilities
@@ -78,34 +78,28 @@ def make_feols_in_r(df: pd.DataFrame,
                     outcome: str,
                     regressors: Sequence[str] | None,
                     fe: Sequence[str] | None):
-    """Fit fixest::feols in R on a sanitized sub-dataframe.
 
-    We keep the sub-dataframe in Python so that clustid lookups are
-    well-defined (but boottest() itself only needs the fitted object).
-    """
     fixest = importr("fixest")
 
     used_reg = _sanitize_varlist(df, regressors)
     used_fe = _sanitize_fe_list(df, fe)
 
     keep_cols = [c for c in {outcome, *used_reg, *used_fe} if c in df.columns]
-    sub = df.loc[:, keep_cols].copy()
+    sub = df  # or df.loc[:, keep_cols].copy()
 
-    # Make sure regressors are numeric where that is appropriate
+    #print('\n', outcome, regressors, fe)
+
+    # 1) Regressors: coerce to numeric where appropriate
     for c in used_reg:
-        if c in sub.columns and not np.issubdtype(sub[c].dtype, np.number):
+        #print(c, type(sub), type(sub[c]))
+        if c in sub.columns and not is_numeric_dtype(sub[c]):
             sub[c] = pd.to_numeric(sub[c], errors="coerce")
 
-    # Fixed-effects and clustering variables should be treated as
-    # *coded* factors in R. fwildclusterboot sometimes constructs
-    # expressions like `cluster1 + cluster2` internally; if these
-    # are characters this yields `non-numeric argument to binary
-    # operator`. We therefore coerce non-numeric FE columns to
-    # integer codes (via pandas categorical), which map one-to-one
-    # to levels but are safe to add.
+    # 2) Fixed effects: coerce non-numeric to integer codes
     for c in used_fe:
-        if c in sub.columns and not np.issubdtype(sub[c].dtype, np.number):
-            sub[c] = sub[c].astype("category").cat.codes
+        #print(c, type(sub), type(sub[c]))
+        if c in sub.columns and not is_numeric_dtype(sub[c]):
+            sub[c] = sub[c].astype("category").cat.codes.astype("int64")
 
     fml_str = build_fixest_formula(outcome, used_reg, used_fe)
 
@@ -115,6 +109,7 @@ def make_feols_in_r(df: pd.DataFrame,
     fml = ro.r(f"as.formula('{fml_str}')")
     fit = fixest.feols(fml, data=r_df)
     return fit, sub, fml_str
+
 
 
 

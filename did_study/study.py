@@ -5,16 +5,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
-
+import hashlib
+import json
+import pickle
+from pathlib import Path
 import numpy as np
 import pandas as pd
 
 from .helpers.config import StudyConfig
 from .helpers.preparation import PanelData
 from .estimator import DidEstimator
-from .estimators.att_differences import DifferencesAttResult
 from .robustness.honest_did import honest_did_bounds
 from .helpers.utils import choose_wcb_weights_and_B
+from .estimators.att_differences import DifferencesAttResult
 
 
 @dataclass
@@ -25,7 +28,8 @@ class DidStudyResult:
 
     # Core estimators
     att: Optional[Any] = None
-    att_test: Optional[DifferencesAttResult] = None  # 'true' ATT^o via differences
+    # Differences-based ATT^o (Callaway–Sant'Anna via `differences`)
+    att_test: Optional[DifferencesAttResult] = None
     bins: Optional[Any] = None
     event_study: Optional[Any] = None
 
@@ -53,18 +57,29 @@ class DidStudy:
         self.config = config
         self._estimator: Optional[DidEstimator] = None
         self._panel: Optional[PanelData] = None
+        
 
     @property
     def estimator(self) -> DidEstimator:
         if self._estimator is None:
             raise RuntimeError("Estimator not initialised yet. Call .run().")
         return self._estimator
+    
+    def _init_panel(self):
+        # 1) Prepare panel (with caching)
+        panel = self._load_cached_panel()
+        if panel is None:
+            panel = PanelData(self.config)
+            self._cache_panel(panel)
+
+        self._panel = panel
+        return panel.panel
 
     def run(
         self,
         *,
         run_att: bool = True,
-        run_bins: bool = True,
+        run_bins: bool = False,
         run_event_study: bool = True,
         run_honest_did: bool = True,
     ) -> DidStudyResult:
@@ -88,10 +103,8 @@ class DidStudy:
             Container with all estimates and robustness checks.
         """
 
-        # 1) Prepare panel
-        panel = PanelData(self.config)
-        self._panel = panel
-        df = panel.panel
+        df = self._init_panel()
+        panel = self._panel
 
         if df is not None and "dose_level" in df.columns:
             info = getattr(panel, "info", {})
@@ -143,17 +156,12 @@ class DidStudy:
         # 4) ATT^o (pooled)
         if run_att:
             result.att = self.estimator.estimate_att_o(panel=panel, wcb_args=wcb_args)
-            # 'test' ATT^o via differences (Callaway–Sant'Anna ATTgt)
-            try:
-                result.att_test = self.estimator.estimate_att_o_differences(panel=panel)
-            except Exception as e:
-                print("[differences ATT^o] failed:", repr(e))
-                result.att_test = None
+            # Also try the Callaway–Sant'Anna style ATT^o via `differences`
+            result.att_test = self.estimator.estimate_att_o_differences(panel=panel, wcb_args=wcb_args)
 
         # 5) Bins
-        has_dose_bins = bool(df is not None and "dose_bin" in df.columns)
-        if run_bins and has_dose_bins:
-            result.bins = self.estimator.estimate_binned_att_o(panel=panel, wcb_args=wcb_args)
+        # 5) Bins (disabled in study run)
+        # We intentionally skip binned ATT^o to keep the study focused on pooled effects.
 
         # 6) Event study
         if run_event_study:
@@ -345,3 +353,77 @@ class DidStudy:
             "method": res.method,
             "delta_label": res.delta_label,
         }
+
+    # ------------------------------------------------------------------
+    # Panel caching helpers
+    # ------------------------------------------------------------------
+    def _panel_cache_payload(self) -> Optional[dict]:
+        try:
+            cfg = self.config
+
+            def _normalize(val: Any) -> Any:
+                if isinstance(val, (str, int, float, bool)) or val is None:
+                    return val
+                if isinstance(val, (list, tuple)):
+                    return [_normalize(x) for x in val]
+                if isinstance(val, set):
+                    return sorted(_normalize(x) for x in val)
+                if isinstance(val, dict):
+                    return {
+                        str(k): _normalize(v)
+                        for k, v in sorted(val.items(), key=lambda kv: str(kv[0]))
+                    }
+                return str(val)
+
+            payload: Dict[str, Any] = {}
+            for k, v in vars(cfg).items():
+                if k == "df":
+                    continue
+                payload[k] = _normalize(v)
+            return payload
+        except Exception:
+            return None
+
+    def _panel_cache_path(self) -> Optional[Path]:
+        payload = self._panel_cache_payload()
+        if payload is None:
+            return None
+        try:
+            key = hashlib.sha256(
+                json.dumps(payload, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+        except Exception:
+            return None
+
+        cache_root = getattr(self.config, "artifact_dir", None)
+        if cache_root:
+            cache_root = Path(cache_root)
+        else:
+            cache_root = Path("./_panel_cache")
+        return cache_root / "panel_cache" / f"panel_{key}.pkl"
+
+    def _load_cached_panel(self) -> Optional[PanelData]:
+        cache_path = self._panel_cache_path()
+        if cache_path is None or not cache_path.exists():
+            return None
+        try:
+            with cache_path.open("rb") as fh:
+                panel = pickle.load(fh)
+            if isinstance(panel, PanelData):
+                return panel
+        except Exception:
+            return None
+        return None
+
+    def _cache_panel(self, panel: PanelData) -> None:
+        cache_path = self._panel_cache_path()
+        if cache_path is None:
+            return
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+            with tmp_path.open("wb") as fh:
+                pickle.dump(panel, fh)
+            tmp_path.replace(cache_path)
+        except Exception:
+            pass

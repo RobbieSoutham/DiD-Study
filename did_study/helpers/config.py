@@ -24,7 +24,8 @@ class StudyConfig:
     # You may also pass the name of a custom outcome column in your df.
     outcome_mode: Literal["direct", "total"] | str = "direct"
     use_log_outcome: bool = True
-    differenced: bool = True
+    differenced: bool = False
+    use_lag_levels_in_diff = False
 
     # =========================
     # Unit & schema

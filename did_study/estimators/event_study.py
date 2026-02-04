@@ -184,58 +184,43 @@ def event_study(
     # 2) Joint WCB test across all ES coefficients
     wcb_p: float | np.nan = np.nan
     if wcb_args and es_all_names:
-        cluster_spec = (
-            wcb_args.get("cluster_terms")
-            or wcb_args.get("cluster_spec")
-            or cluster_col
-        )
-        if isinstance(cluster_spec, str):
-            cluster_list = [cluster_spec]
-        else:
-            cluster_list = list(cluster_spec or [])
-        cluster_list = [c for c in cluster_list if c in used.columns]
-        if not cluster_list:
-            cluster_list = [cluster_col]
-
+        cluster_list = [cluster_col]
         impose_null = bool(wcb_args.get("impose_null", True))
         B = int(wcb_args.get("B", 9999))
         weights = wcb_args.get("weights", "rademacher")
         seed = wcb_args.get("seed")
         regressors = inter_cols + covs
 
-        try:
-            candidate_cols = (
-                [outcome_col, cluster_col, year_col]
-                + regressors
-                + list(fe_terms or [])
-                + cluster_list
-            )
-            wcb_cols: List[str] = []
-            for col in candidate_cols:
-                if col in used.columns and col not in wcb_cols:
-                    wcb_cols.append(col)
-            wcb_df = used[wcb_cols].copy()
+        candidate_cols = (
+            [outcome_col, cluster_col, year_col]
+            + regressors
+            + list(fe_terms or [])
+            + cluster_list
+        )
+        wcb_cols: List[str] = []
+        for col in candidate_cols:
+            if col in used.columns and col not in wcb_cols:
+                wcb_cols.append(col)
+        if cluster_col not in wcb_cols:
+            wcb_cols.append(cluster_col)
+       
+        wcb_df = used[wcb_cols].copy()
+        runner = make_wcb_runner(
+            df=wcb_df,
+            outcome=outcome_col,
+            regressors=regressors,
+            fe=list(fe_terms or []),
+            cluster=cluster_list,
+            B=B,
+            weights=weights,
+            impose_null=impose_null,
+            seed=seed,
+        )
 
-            runner = make_wcb_runner(
-                df=wcb_df,
-                outcome=outcome_col,
-                regressors=regressors,
-                fe=list(fe_terms or []),
-                cluster=cluster_list,
-                B=B,
-                weights=weights,
-                impose_null=impose_null,
-                seed=seed,
-            )
-
-            wcb_val = runner.pvalue(TestSpec(joint_zero=es_all_names))
-            if isinstance(wcb_val, float) and not np.isnan(wcb_val):
-                wcb_p = float(wcb_val)
-            else:
-                wcb_p = np.nan
-        except Exception as e:
-            # YOUR REQUEST: if WCB fails, print the exception
-            print(f"[Event Study][joint WCB] failed: {e}")
+        wcb_val = runner.pvalue(TestSpec(joint_zero=es_all_names))
+        if isinstance(wcb_val, float) and not np.isnan(wcb_val):
+            wcb_p = float(wcb_val)
+        else:
             wcb_p = np.nan
             
     # ------------------------------------------------------------------
