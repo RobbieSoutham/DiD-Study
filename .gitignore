@@ -17,12 +17,32 @@ __pycache__/
 # Virtual environments
 .venv/
 venv/
+new_venv/
 env/
 ENV/
 .python-env/
 .python_env/
 
+_panel_cache/*
+_panel_cache/_panel_cache/*
+*.pyc
+*/*.pyc
+*/*/*.pyc
+*/*/*/*.pyc
+*/__pycache__/*
+*/*/__pycache__/*
+*/*/*/__pycache__/*
+did_study/__pycache__/
+*.tex
+*.rar
 # Packaging / build
+lateststudy.pkl
+power_tuner.py
+pt.py
+support_counts.tex
+test.py
+test2.py
+testing.py
 build/
 dist/
 .eggs/
