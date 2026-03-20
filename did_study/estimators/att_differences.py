@@ -5,6 +5,10 @@
 from __future__ import annotations
 
 
+# Register formulaic pandas materializer before importing differences
+from formulaic.materializers.pandas import PandasMaterializer  # noqa: F401
+
+
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, List
 from differences.attgt.attgt import ATTgt
@@ -401,7 +405,7 @@ def estimate_att_o_differences(
     agg_df = attgt.aggregate(
         type_of_aggregation="simple",
         overall=True,
-        boot_iterations=(wcb_args).get("B", 0)
+        boot_iterations=(wcb_args or {}).get("B", 0)
         )
 
 

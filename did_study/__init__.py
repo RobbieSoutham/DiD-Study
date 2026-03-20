@@ -32,18 +32,18 @@ The package exposes three core classes:
 References
 ----------
 The implementation follows recommendations from several strands of the
-literature.  
+literature.
 
 * Callaway and Sant'Anna describe how to summarize group-time treatment
   effects into a single average treatment on the treated using simple and
   weighted averages[567999609739277^L700-L731].  The package implements
-  a collapsed regression to estimate this ``ATT^o`` parameter.  
+  a collapsed regression to estimate this ``ATT^o`` parameter.
 
 * Cameron, Gelbach and Miller show that cluster-robust methods can
   over-reject when the number of clusters is small and propose bootstrap
   procedures to improve inference[287988434127442^L33-L47].  We employ the
   wild cluster bootstrap as implemented in the `fwildclusterboot` R package
-  to obtain p-values.  
+  to obtain p-values.
 
 * Simulation studies suggest that wild bootstrap tests based on the
   Rademacher distribution perform well in general, but when the number of
@@ -58,3 +58,6 @@ literature.
   conditioning the analysis.
 
 """
+
+# Register formulaic pandas materializer early to avoid issues with differences package
+from formulaic.materializers.pandas import PandasMaterializer  # noqa: F401

@@ -1,0 +1,339 @@
+# did_study/estimators/att_contdid.py
+"""
+Python bridge to the Callaway, Goodman-Bacon & Sant'Anna (2024) contdid R package.
+
+The function writes the prepared panel to a temporary CSV, invokes the R
+driver script via subprocess, and returns a ContdidAttResult pointing to
+the output directory.  The R script is expected to produce:
+  <artifact_dir>/contdid/contdid_eventstudy.csv
+  <artifact_dir>/contdid/contdid_att_gt.csv
+  <artifact_dir>/contdid/summary.json
+"""
+from __future__ import annotations
+
+import os
+import subprocess
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+import pandas as pd
+
+from ..helpers.config import StudyConfig
+
+
+@dataclass
+class ContdidAttResult:
+    """Result container for Callaway et al. contdid estimation.
+
+    Artefacts (CSVs, summary.json) are written to ``artifact_dir/contdid/``
+    by the R driver script.  Use ``status`` to detect failures.
+    """
+    artifact_dir: str
+    dose_col: str = "dose_level"
+    status: str = "ok"
+    error: Optional[str] = None
+
+
+def estimate_att_o_contdid(
+    panel,
+    config: StudyConfig,
+    *,
+    dose_col: str = "dose_level",
+) -> ContdidAttResult:
+    """
+    Call the contdid R package via an external Rscript process.
+
+    Parameters
+    ----------
+    panel : PanelData
+        Prepared panel object (panel.panel is the DataFrame).
+    config : StudyConfig
+        Study configuration.  Uses ``artifact_dir``, ``year_col``,
+        ``rscript_path``, ``r_lib_paths``, and ``r_env``.
+    dose_col : str
+        Name of the continuous dose column in the panel DataFrame.
+    """
+    artifact_dir = getattr(config, "artifact_dir", None) or "results/contdid"
+    out_dir = Path(artifact_dir) / "contdid"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    df = panel.panel.copy()
+
+    # Write panel to a temporary CSV
+    tmp_csv = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".csv", delete=False, prefix="contdid_panel_"
+        ) as tmp:
+            df.to_csv(tmp.name, index=False)
+            tmp_csv = tmp.name
+
+        year_col = getattr(config, "year_col", "Year")
+        unit_col = "unit_id"
+        outcome = panel.outcome_name
+
+        rscript_exe = getattr(config, "rscript_path", None) or "Rscript"
+
+        env = dict(os.environ)
+        env.update(getattr(config, "r_env", None) or {})
+        r_lib = getattr(config, "r_lib_paths", None)
+        if r_lib:
+            env["R_LIBS_USER"] = ":".join(str(p) for p in r_lib)
+
+        # Locate the R driver script
+        r_script = _find_r_script()
+        if r_script is None:
+            r_script = _write_inline_r_script(out_dir)
+
+        cmd = [
+            rscript_exe,
+            "--vanilla",
+            str(r_script),
+            "--data", tmp_csv,
+            "--out_dir", str(out_dir),
+            "--dose_col", dose_col,
+            "--year_col", year_col,
+            "--unit_col", unit_col,
+            "--outcome_col", outcome,
+        ]
+
+        print(f"[contdid] Running: {' '.join(cmd)}")
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, env=env, timeout=600
+        )
+
+        if proc.stdout:
+            print("[contdid R]", proc.stdout.strip())
+        if proc.returncode != 0:
+            err = f"Rscript exited with code {proc.returncode}:\n{proc.stderr}"
+            print(f"[contdid] ERROR: {err}")
+            return ContdidAttResult(
+                artifact_dir=str(artifact_dir),
+                dose_col=dose_col,
+                status="error",
+                error=err,
+            )
+
+        return ContdidAttResult(
+            artifact_dir=str(artifact_dir),
+            dose_col=dose_col,
+            status="ok",
+        )
+
+    except Exception as exc:
+        err = f"estimate_att_o_contdid raised: {exc}"
+        print(f"[contdid] {err}")
+        return ContdidAttResult(
+            artifact_dir=str(artifact_dir),
+            dose_col=dose_col,
+            status="error",
+            error=str(exc),
+        )
+    finally:
+        if tmp_csv is not None:
+            try:
+                os.unlink(tmp_csv)
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# R script helpers
+# ---------------------------------------------------------------------------
+
+def _find_r_script() -> Optional[Path]:
+    """Look for a bundled R driver script in common locations."""
+    candidates = [
+        Path("scripts/run_ccus_contdid.R"),
+        Path("scripts/run_synth_contdid_demo.R"),
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return None
+
+
+def _write_inline_r_script(out_dir: Path) -> Path:
+    """Write a minimal self-contained R driver using the contdid package."""
+    script_path = out_dir / "_contdid_driver.R"
+    script_content = r"""
+# Minimal contdid driver — auto-generated by did_study.estimators.att_contdid
+suppressPackageStartupMessages({
+  library(contdid)
+  library(jsonlite)
+})
+
+`%||%` <- function(a, b) if (!is.null(a) && length(a) > 0) a else b
+
+parse_arg <- function(flag, args = commandArgs(trailingOnly = TRUE)) {
+  idx <- which(args == flag)
+  if (length(idx) == 0) return(NULL)
+  args[[idx + 1]]
+}
+
+args        <- commandArgs(trailingOnly = TRUE)
+data_path   <- parse_arg("--data",        args)
+out_dir     <- parse_arg("--out_dir",     args)
+dose_col    <- parse_arg("--dose_col",    args) %||% "dose_level"
+year_col    <- parse_arg("--year_col",    args) %||% "Year"
+unit_col    <- parse_arg("--unit_col",    args) %||% "unit_id"
+outcome_col <- parse_arg("--outcome_col", args)
+
+if (is.null(data_path) || is.null(out_dir) || is.null(outcome_col)) {
+  stop("Missing required arguments: --data, --out_dir, --outcome_col")
+}
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+df <- read.csv(data_path, stringsAsFactors = FALSE)
+df[[dose_col]]  <- as.numeric(df[[dose_col]])
+df[[year_col]]  <- as.integer(df[[year_col]])
+df[[unit_col]]  <- as.character(df[[unit_col]])
+
+# Rename to standard contdid column names
+df$Y           <- df[[outcome_col]]
+df$time_period <- as.integer(df[[year_col]])
+df$id          <- as.character(df[[unit_col]])
+# Rename any lowercase 'g' column to avoid shadowing the contdid function argument 'g'
+if ("g" %in% names(df)) names(df)[names(df) == "g"] <- "cohort_g"
+
+# contdid expects D to be a unit-level constant dose (not time-varying):
+#   treated units get a positive constant D in ALL periods,
+#   never-treated units get D = 0 in all periods.
+# Compute each unit's characteristic dose as mean positive dose across post-treatment rows.
+raw_dose <- as.numeric(df[[dose_col]])
+unit_dose <- tapply(raw_dose, df$id, function(x) {
+  pos <- x[!is.na(x) & x > 0]
+  if (length(pos) == 0) 0.0 else mean(pos)
+})
+df$D <- unit_dose[df$id]
+
+# Compute G: first period with raw dose > 0 for each unit; 0 if never treated
+first_treat <- tapply(df$time_period[!is.na(raw_dose) & raw_dose > 0],
+                      df$id[!is.na(raw_dose) & raw_dose > 0], min)
+df$G <- 0L
+treated_ids <- names(first_treat)
+for (uid in treated_ids) {
+  df$G[df$id == uid] <- as.integer(first_treat[[uid]])
+}
+
+treated_rows <- df[!is.na(df$D) & df$D > 0, ]
+if (nrow(treated_rows) == 0) {
+  message("[contdid] No treated observations found; writing empty outputs.")
+  write.csv(data.frame(tau=integer(), att=numeric(), se=numeric()),
+            file.path(out_dir, "contdid_eventstudy.csv"), row.names = FALSE)
+  write.csv(data.frame(g=integer(), t=integer(), event_time=integer(), att=numeric(), se=numeric()),
+            file.path(out_dir, "contdid_att_gt.csv"), row.names = FALSE)
+  write.csv(data.frame(dose=numeric(), att_d=numeric(), se=numeric()),
+            file.path(out_dir, "contdid_dose_response.csv"), row.names = FALSE)
+  write(toJSON(list(status="no_treated"), auto_unbox=TRUE),
+        file.path(out_dir, "summary.json"))
+  quit(status = 0)
+}
+
+tryCatch({
+  res <- contdid::cont_did(
+    yname            = "Y",
+    dname            = "D",
+    gname            = "G",
+    tname            = "time_period",
+    idname           = "id",
+    data             = df,
+    aggregation      = "eventstudy",
+    target_parameter = "slope",
+    treatment_type   = "continuous",
+    control_group    = "nevertreated",
+    bstrap           = FALSE
+  )
+
+  # pte_results: event study aggregation is in res$event_study
+  es  <- res$event_study
+  es_df <- data.frame(
+    tau = es$egt,
+    att = es$att.egt,
+    se  = es$se.egt
+  )
+  write.csv(es_df, file.path(out_dir, "contdid_eventstudy.csv"), row.names = FALSE)
+
+  # ATT(g, t) — available in res$att_gt; group/t are already original calendar years
+  if (!is.null(res$att_gt)) {
+    gt_g   <- res$att_gt$group
+    gt_t   <- res$att_gt$t
+    gt_att <- res$att_gt$att
+    gt_se  <- if (!is.null(res$att_gt$se)) res$att_gt$se else rep(NA_real_, length(gt_att))
+    gt_df <- data.frame(
+      g          = gt_g,
+      t          = gt_t,
+      event_time = gt_t - gt_g,
+      att        = gt_att,
+      se         = gt_se
+    )
+  } else {
+    gt_df <- data.frame(g=integer(), t=integer(), event_time=integer(), att=numeric(), se=numeric())
+  }
+  write.csv(gt_df, file.path(out_dir, "contdid_att_gt.csv"), row.names = FALSE)
+
+  # Dose-response curve (aggregation="dose")
+  # Dose-response curve: try slope first, fall back to level
+  dose_df <- tryCatch({
+    res_dose <- contdid::cont_did(
+      yname            = "Y",
+      dname            = "D",
+      gname            = "G",
+      tname            = "time_period",
+      idname           = "id",
+      data             = df,
+      aggregation      = "dose",
+      target_parameter = "slope",
+      treatment_type   = "continuous",
+      control_group    = "nevertreated",
+      bstrap           = FALSE
+    )
+    data.frame(
+      dose  = res_dose$dose,
+      att_d = res_dose$acrt.d,
+      se    = res_dose$acrt.d_se
+    )
+  }, error = function(e1) {
+    tryCatch({
+      res_dose2 <- contdid::cont_did(
+        yname            = "Y",
+        dname            = "D",
+        gname            = "G",
+        tname            = "time_period",
+        idname           = "id",
+        data             = df,
+        aggregation      = "dose",
+        target_parameter = "level",
+        treatment_type   = "continuous",
+        control_group    = "nevertreated",
+        bstrap           = FALSE
+      )
+      data.frame(
+        dose  = res_dose2$dose,
+        att_d = res_dose2$att.d,
+        se    = res_dose2$att.d_se
+      )
+    }, error = function(e2) {
+      message("[contdid] dose aggregation failed (non-fatal): ", conditionMessage(e2))
+      data.frame(dose=numeric(), att_d=numeric(), se=numeric())
+    })
+  })
+  write.csv(dose_df, file.path(out_dir, "contdid_dose_response.csv"), row.names = FALSE)
+
+  # Summary
+  summ <- list(status = "ok", n_event_times = nrow(es_df), n_dose_points = nrow(dose_df))
+  write(toJSON(summ, auto_unbox = TRUE), file.path(out_dir, "summary.json"))
+  message("[contdid] Completed successfully.")
+
+}, error = function(e) {
+  message("[contdid] Error: ", conditionMessage(e))
+  message("[contdid] Traceback:")
+  message(paste(capture.output(traceback()), collapse="\n"))
+  quit(status = 1)
+})
+"""
+    script_path.write_text(script_content, encoding="utf-8")
+    return script_path

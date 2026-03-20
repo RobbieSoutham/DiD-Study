@@ -12,6 +12,14 @@ from did_study.estimators.att_differences import (
     DifferencesAttResult,
     estimate_att_o_differences,
 )
+from did_study.estimators.att_continuous import (
+    ContinuousAttResult,
+    estimate_att_o_continuous,
+)
+from did_study.estimators.att_contdid import (
+    ContdidAttResult,
+    estimate_att_o_contdid,
+)
 from did_study.estimators.bins import BinAttResult, estimate_binned_att_o
 from did_study.estimators.event_study import EventStudyResult, event_study
 
@@ -49,6 +57,35 @@ class DidEstimator(BaseEstimator):
         wcb_args: Optional[Dict[str, Any]] = None,
     ) -> BinAttResult | pd.DataFrame:
         return estimate_binned_att_o(panel, self.config, fe_terms=fe_terms, wcb_args=wcb_args)
+
+    # ---------------------------------------------------------
+    # Continuous-dose ATT^o (Python TWFE)
+    # ---------------------------------------------------------
+    def estimate_att_o_continuous(
+        self,
+        panel: PanelData,
+        fe_terms: Optional[Sequence[str]] = None,
+        dose_col: str = "dose_level",
+        wcb_args: Optional[Dict[str, Any]] = None,
+    ) -> ContinuousAttResult:
+        return estimate_att_o_continuous(
+            panel,
+            self.config,
+            fe_terms=fe_terms,
+            dose_col=dose_col,
+            wcb_args=wcb_args,
+        )
+
+    # ---------------------------------------------------------
+    # Continuous-dose ATT^o via contdid (R)
+    # ---------------------------------------------------------
+    def estimate_att_o_contdid(
+        self,
+        panel: PanelData,
+        *,
+        dose_col: str = "dose_level",
+    ) -> ContdidAttResult:
+        return estimate_att_o_contdid(panel, self.config, dose_col=dose_col)
 
     # ---------------------------------------------------------
     # Event study (pooled)

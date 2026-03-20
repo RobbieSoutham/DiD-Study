@@ -24,8 +24,7 @@ class StudyConfig:
     # You may also pass the name of a custom outcome column in your df.
     outcome_mode: Literal["direct", "total"] | str = "direct"
     use_log_outcome: bool = True
-    differenced: bool = False
-    use_lag_levels_in_diff = False
+    differenced: bool = True
 
     # =========================
     # Unit & schema
@@ -94,6 +93,9 @@ class StudyConfig:
     honestdid_Mbar: Optional[float] = None  # if None, will calibrate/conservative
     honestdid_M_grid: Optional[List[float]] = None  # e.g. [0.0, 0.25, 0.5, 1.0]
 
+    # Callaway et al. continuous-treatment DiD (contdid R package)
+    contdid_enable: bool = False
+
     # R bridge (for HonestDiD / WCB original implementations)
     r_bridge: bool = True
     rscript_path: Optional[str] = None          # if None, rely on PATH
@@ -139,8 +141,10 @@ class StudyConfig:
             honestdid_by_bin=self.honestdid_by_bin,
             honestdid_Mbar=self.honestdid_Mbar,
             honestdid_M_grid=list(self.honestdid_M_grid) if self.honestdid_M_grid is not None else None,
+            contdid_enable=self.contdid_enable,
             r_bridge=self.r_bridge,
             rscript_path=self.rscript_path,
             r_lib_paths=list(self.r_lib_paths) if self.r_lib_paths is not None else None,
             r_env=dict(self.r_env) if self.r_env is not None else None,
+            cluster_col=self.cluster_col,
         )
