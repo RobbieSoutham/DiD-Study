@@ -2,6 +2,10 @@
 from __future__ import annotations
 from typing import Any, Sequence, Optional, Dict, List, Tuple
 
+import os
+import shutil
+import subprocess
+
 import numpy as np
 import pandas as pd
 
@@ -10,7 +14,64 @@ from rpy2.robjects import pandas2ri
 from rpy2.robjects.conversion import localconverter
 from rpy2.robjects.vectors import FloatVector
 from rpy2.robjects.packages import importr
+from rpy2.rinterface_lib.embedded import RRuntimeError
 from pandas.api.types import is_numeric_dtype
+
+
+def _julia_sys_bindir() -> Optional[str]:
+    """Return Julia's real Sys.BINDIR, not a juliaup shim directory."""
+
+    try:
+        julia = shutil.which("julia")
+        if not julia:
+            return None
+        out = subprocess.check_output(
+            [julia, "-e", "print(Sys.BINDIR)"],
+            text=True,
+            timeout=10,
+        ).strip()
+        return out or None
+    except Exception:
+        return None
+
+
+def _valid_julia_bindir(path: Optional[str]) -> bool:
+    if not path:
+        return False
+    sysimage = os.path.abspath(os.path.join(path, "..", "lib", "julia", "sys.so"))
+    return os.path.exists(sysimage)
+
+
+def _configure_julia_connector_env() -> None:
+    """Set conservative JuliaConnectoR startup defaults before first use.
+
+    fwildclusterboot's joint tests use JuliaConnectoR/WildBootTests.jl. On this
+    workspace the Julia server can legitimately spend more than the package's
+    default 60 seconds without writing startup output during compilation. The
+    environment variables below are read by JuliaConnectoR before it opens the
+    Julia connection, so set them in both Python and the embedded R process.
+    """
+
+    defaults = {
+        "JULIACONNECTOR_SILENCE_TIMEOUT": "300",
+        "JULIACONNECTOR_MAX_TIMEOUT": "900",
+    }
+    bindir = os.environ.get("JULIA_BINDIR")
+    if not _valid_julia_bindir(bindir):
+        bindir = _julia_sys_bindir()
+    if _valid_julia_bindir(bindir):
+        defaults["JULIA_BINDIR"] = str(bindir)
+
+    for key, value in defaults.items():
+        if key == "JULIA_BINDIR" or key not in os.environ:
+            os.environ[key] = value
+        try:
+            ro.r["Sys.setenv"](**{key: os.environ.get(key, value)})
+        except Exception:
+            pass
+
+
+_configure_julia_connector_env()
 
 # ---------------------------------------------------------------------
 # Small utilities
@@ -323,7 +384,7 @@ def mboottest_fixest(
     # 5) Call mboottest
     try:
         res = fwb.mboottest(**args)
-    except ro.RRuntimeError as e:
+    except RRuntimeError as e:
         # If we hit "unused argument" errors for old versions, try stripping
         # type/clustid once and re-running.
         msg = str(e)

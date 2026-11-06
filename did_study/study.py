@@ -14,6 +14,7 @@ from .helpers.preparation import PanelData
 from .estimator import DidEstimator
 from .robustness.honest_did import honest_did_bounds
 from .helpers.utils import choose_wcb_weights_and_B
+from .estimators.att_differences import DifferencesAttResult
 
 
 @dataclass
@@ -22,8 +23,8 @@ class DidStudyResult:
     config: StudyConfig
     data: PanelData
 
-    # Core estimators
-    att: Optional[Any] = None
+    # Core headline estimator: ATT^o via Callaway-Sant'Anna / `differences`.
+    att_test: Optional[DifferencesAttResult] = None
     att_continuous: Optional[Any] = None
     bins: Optional[Any] = None
     event_study: Optional[Any] = None
@@ -63,7 +64,7 @@ class DidStudy:
         self,
         *,
         run_att: bool = True,
-        run_bins: bool = True,
+        run_bins: bool = False,
         run_event_study: bool = True,
         run_honest_did: bool = True,
     ) -> DidStudyResult:
@@ -139,9 +140,12 @@ class DidStudy:
         self._estimator = DidEstimator(self.config)
         result = DidStudyResult(config=self.config, data=panel)
 
-        # 4) ATT^o (pooled)
+        # 4) Headline ATT^o (pooled Callaway-Sant'Anna / differences)
         if run_att:
-            result.att = self.estimator.estimate_att_o(panel=panel, wcb_args=wcb_args)
+            result.att_test = self.estimator.estimate_att_o_differences(
+                panel=panel,
+                wcb_args=wcb_args,
+            )
 
         # 4b) Continuous-dose ATT^o (contdid or Python TWFE)
         contdid_enabled = bool(getattr(self.config, "contdid_enable", False))

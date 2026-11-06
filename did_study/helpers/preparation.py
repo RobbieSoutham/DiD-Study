@@ -341,6 +341,14 @@ class PanelData:
                 emissions_sector_col=cfg.emissions_sector_col, outcome_col=cfg.outcome_col,
                 ccus_col=ccus_col, emap=emap, weights=getattr(cfg, "mapping_weights", None)
             )
+            if y_ccus.empty:
+                observed = sorted(d[cfg.emissions_sector_col].dropna().astype(str).unique())[:8]
+                mapped = sorted(str(e) for sectors in emap.values() for e in set(sectors))[:8]
+                raise ValueError(
+                    "[prepare] direct outcome allocation produced no rows. "
+                    "Check emissions_sector labels, outcome_mode, and mapping. "
+                    f"observed_sample={observed}; mapped_sample={mapped}"
+                )
             g = g.merge(y_ccus, on=[country_col, ccus_col, cfg.year_col], how="left")
         elif cfg.outcome_mode == "total":
             y_cy = (
@@ -653,6 +661,8 @@ class PanelData:
         # ---------- (7) Trim units by support (differencing-aware) ----------
         effective_min_pre = max(1, cfg.min_pre - (1 if cfg.differenced else 0))
         effective_min_post = cfg.min_post
+        support_units_before = g["unit_id"].nunique()
+        support_obs_before = len(g)
         keep_units: List[str] = []
         for uid, dfu in g.groupby("unit_id", sort=False):
             # Guard against pathological empty groups
@@ -677,6 +687,14 @@ class PanelData:
         if dropped_units:
             _p(f"[prepare] Dropped {len(dropped_units)} units with insufficient pre/post support.")
         g = g[g["unit_id"].isin(keep_units)].copy()
+        if g.empty:
+            raise ValueError(
+                "[prepare] Support restrictions left zero rows "
+                f"(min_pre={cfg.min_pre}, min_post={cfg.min_post}, "
+                f"differenced={cfg.differenced}, effective_min_pre={effective_min_pre}, "
+                f"effective_min_post={effective_min_post}, units_before={support_units_before}, "
+                f"obs_before={support_obs_before}). Check input data coverage and treatment timing."
+            )
 
         # ---------- (8) Bin diagnostics after trimming (no re-binning) ----------
         if "dose_bin" in g.columns:

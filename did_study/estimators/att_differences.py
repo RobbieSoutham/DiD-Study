@@ -11,7 +11,12 @@ from formulaic.materializers.pandas import PandasMaterializer  # noqa: F401
 
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, List
-from differences.attgt.attgt import ATTgt
+try:
+    from differences.attgt.attgt import ATTgt
+    _ATTGT_COHORT_KWARG = "cohort_name"
+except ModuleNotFoundError:
+    from differences.models.attgt.attgt import ATTgt
+    _ATTGT_COHORT_KWARG = "cohort_column"
 
 import math
 import os
@@ -63,10 +68,13 @@ class DifferencesAttResult:
     # Extra detail fields (all NaN when not available)
     se_boot: float | np.nan = math.nan
     p_boot: float | np.nan = math.nan
+    # The differences ATT^o path uses analytic and ordinary-bootstrap
+    # inference. It does not run a wild-cluster bootstrap for ATT^o.
     p_wcb: float | np.nan = math.nan
 
     ci_lower: float | np.nan = math.nan
     ci_upper: float | np.nan = math.nan
+    covariates_used: List[str] | None = None
 
 
 
@@ -266,40 +274,41 @@ def _extract_bootstrap_details_from_full_results(
     p_boot = math.nan
 
 
-    # Handle MultiIndex columns
     if isinstance(res_df.columns, pd.MultiIndex):
+        def _find_col(*levels: str) -> pd.Series | None:
+            wanted = [level.lower() for level in levels]
+            for col in res_df.columns:
+                parts = [str(part).lower() for part in col if str(part)]
+                if all(level in parts for level in wanted):
+                    return res_df[col]
+            return None
+
         # Try to extract analytic SE
-        try:
-            se_analytic = res_df[('ATTgtResult', 'analytic', 'std_error')].mean()
-        except KeyError:
-            pass
+        col = _find_col("analytic", "std_error")
+        if col is not None:
+            se_analytic = float(col.mean())
 
 
         # Try to extract bootstrap SE
-        try:
-            se_boot = res_df[('ATTgtResult', 'bootstrap', 'std_error')].mean()
-        except KeyError:
-            pass
+        col = _find_col("bootstrap", "std_error")
+        if col is not None:
+            se_boot = float(col.mean())
 
 
         # Try to extract analytic p-value
-        try:
-            p_analytic = res_df[('ATTgtResult', 'analytic', 'pvalue')].mean()
-        except KeyError:
-            try:
-                p_analytic = res_df[('ATTgtResult', 'analytic', 'p_value')].mean()
-            except KeyError:
-                pass
+        col = _find_col("analytic", "pvalue")
+        if col is None:
+            col = _find_col("analytic", "p_value")
+        if col is not None:
+            p_analytic = float(col.mean())
 
 
         # Try to extract bootstrap p-value
-        try:
-            p_boot = res_df[('ATTgtResult', 'bootstrap', 'pvalue')].mean()
-        except KeyError:
-            try:
-                p_boot = res_df[('ATTgtResult', 'bootstrap', 'p_value')].mean()
-            except KeyError:
-                pass
+        col = _find_col("bootstrap", "pvalue")
+        if col is None:
+            col = _find_col("bootstrap", "p_value")
+        if col is not None:
+            p_boot = float(col.mean())
 
 
     return se_analytic, p_analytic, se_boot, p_boot
@@ -346,7 +355,7 @@ def estimate_att_o_differences(
     # 2) Construct ATTgt object
     ctor_kwargs: Dict[str, Any] = {
         "data": used,
-        "cohort_name": "cohort",
+        _ATTGT_COHORT_KWARG: "cohort",
     }
     if _DIFF_VERBOSE:
         print(f"[differences] ATTgt ctor kwargs: {ctor_kwargs}")
@@ -432,9 +441,10 @@ def estimate_att_o_differences(
 
         se_boot=se_boot,
         p_boot=p_boot,
-        p_wcb=p_boot,
+        p_wcb=math.nan,
 
         ci_lower=ci_lower,
         ci_upper=ci_upper,
+        covariates_used=covariates,
     )
     

@@ -4,7 +4,7 @@ This document formalizes the analysis pipeline implemented in the `did_study` pa
 
 ## Data and Integration
 
-- Sources: IEA CCUS Projects Database (capture capacity), IEA World Energy Balances (supply/demand), EDGAR v8.0 (CO2 emissions), and IMF WEO (macro covariates) \cite{ieaCCUS2024,ieaWorldEnergyBalances2024,edgar2024,imfWEO2024}.
+- Sources: IEA CCUS Projects Database (capture capacity), selected sectoral supply/demand series from IEA World Energy Balances Highlights, EDGAR v8.0 (CO2 emissions), and IMF WEO (macro covariates) \cite{ieaCCUS2024,ieaWorldEnergyBalances2024,edgar2024,imfWEO2024}.
 - Units and years: Country×CCUS sector ("direct" outcome mode) or country totals ("total" mode); annual 1998–2022.
 - Emissions allocation (direct mode): Territorial emissions by emissions sector are mechanically allocated to CCUS sectors via a partition (or weighted mapping) and aggregated to unit level. This preserves consistency with territorial accounting while aligning outcomes to the capture locus.
 - Energy aggregates: Sectoral `Supply_*/Demand_*` series are pivoted to country–year wide form (with totals), enabling composites and principal‑components indexing of fossil demand.
@@ -86,4 +86,3 @@ The implemented pipeline reflects current best practice for staggered‑adoption
 ## References
 
 See `citations.bib` for full entries: \cite{ieaCCUS2024,ieaWorldEnergyBalances2024,edgar2024,imfWEO2024,callawayDifferenceinDifferencesEstimation2021,SunAbraham2021,goodmanDifferenceinDifferencesEstimation2021,chaisemartinTwoWayFixed2020,rothPretestCaution2022,rambachanHonestDiD2023,cameronBootstrapBasedImprovements2008,mackinnonWildBootstrapInference2022,jolliffe2016,findleyExternalValidity2021,callawayDifferenceindifferencesContinuousTreatment2024}.
-

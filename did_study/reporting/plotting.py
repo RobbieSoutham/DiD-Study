@@ -9,6 +9,8 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
+from did_study.helpers.utils import tidy_differences_event_agg_df
+
 
 # ================================
 # Theme + Figure Finalizer
@@ -280,6 +282,7 @@ def plot_dose_distribution(
     ax: plt.Axes,
     palette: Sequence[str],
     bin_edges: Optional[Sequence[float]] = None,
+    bin_labels: Optional[Sequence[str]] = None,
     bins: int = 40,
     density: bool = False,
 ) -> Dict[str, Any]:
@@ -297,7 +300,7 @@ def plot_dose_distribution(
     return {"n": len(x)}
 
 
-@FIG(title="ATT$^{o}$ (pooled)", xlabel=None, ylabel="Effect (Deltalog units)")
+@FIG(title=r"ATT$^{\circ}$ (pooled)", xlabel=None, ylabel="Effect (Deltalog units)")
 def plot_att_pooled_point(
     coef: float,
     lo: float,
@@ -312,7 +315,7 @@ def plot_att_pooled_point(
     return {}
 
 
-@FIG(title="ATT$^{o}$ (pooled + by bin)", xlabel=None, ylabel="Effect (Deltalog units)")
+@FIG(title=r"ATT$^{\circ}$ (pooled + by bin)", xlabel=None, ylabel="Effect (Deltalog units)")
 def plot_att_combined(
     coef: float,
     lo: float,
@@ -356,7 +359,7 @@ def plot_att_combined(
     return {}
 
 
-@FIG(title="ATT$^{o}$ by dose bin", xlabel=None, ylabel="Effect (Deltalog units)")
+@FIG(title=r"ATT$^{\circ}$ by dose bin", xlabel=None, ylabel="Effect (Deltalog units)")
 def plot_att_binned_points(
     bins_labels: Sequence[str],
     coef: Sequence[float],
@@ -727,6 +730,7 @@ def plot_mean_dose_by_tau(
     bin_col: Optional[str] = "dose_bin",
     ref_tau: int = -1,
     show_pooled: bool = True,
+    legend_title: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Plot mean dose by event time with confidence intervals, showing both pooled and by bin.
     
@@ -843,7 +847,7 @@ def plot_mean_dose_by_tau(
     
     # Show legend if we have multiple series (pooled + bins)
     if n_series > 1:
-        ax.legend(loc='best', fontsize=10, frameon=False)
+        ax.legend(loc='best', fontsize=10, frameon=False, title=legend_title)
     
     # Reference tau = -1
     if ref_tau is not None:
@@ -860,7 +864,7 @@ def plot_att_combo(
     pooled: Dict[str, float],
     binned_df: pd.DataFrame,
     es_df: pd.DataFrame,
-    *, suptitle: Optional[str] = "ATT$^{o}$ summary",
+    *, suptitle: Optional[str] = r"ATT$^{\circ}$ summary",
     save: Optional[str] = None,
     show: Optional[bool] = None,
 ) -> plt.Figure:
@@ -872,7 +876,7 @@ def plot_att_combo(
         lo=float(pooled["lo"]),
         hi=float(pooled["hi"]),
         ax=axes[0],
-        title="ATT$^{o}$ (pooled)",
+        title=r"ATT$^{\circ}$ (pooled)",
         ylabel="Effect (Deltalog units)",
     )
     # Binned
@@ -882,7 +886,7 @@ def plot_att_combo(
         lo=binned_df["lo"].astype(float).values,
         hi=binned_df["hi"].astype(float).values,
         ax=axes[1],
-        title="ATT$^{o}$ by dose bin",
+        title=r"ATT$^{\circ}$ by dose bin",
         ylabel=None,
     )
     # ES
@@ -910,6 +914,11 @@ def _as_event_df(res: Any) -> pd.DataFrame:
 
     if isinstance(res, pd.DataFrame):
         df = res.copy()
+        if isinstance(df.columns, pd.MultiIndex) or "event_time" not in df.columns:
+            try:
+                return tidy_differences_event_agg_df(df)
+            except Exception:
+                pass
     elif hasattr(res, "coefs") and isinstance(getattr(res, "coefs"), pd.DataFrame):
         df = res.coefs.copy()
     elif isinstance(res, dict):
@@ -974,6 +983,7 @@ def plot_differences_event_agg(
     Converts event-aggregation output to the canonical event-study line plot.
     """
     df = _as_event_df(res)
+    df = df[df["event_time"] != -1].copy()
     # add normal-approx CI if needed
     if "lo" not in df.columns and "hi" not in df.columns and "se" in df.columns and "beta" in df.columns:
         df = df.copy()
@@ -995,4 +1005,3 @@ def plot_differences_event_agg(
 def plot_differences_att_gt(*args, **kwargs) -> Dict[str, Any]:
     """Deprecated. Kept only so older scripts import cleanly."""
     return {"deprecated": True}
-

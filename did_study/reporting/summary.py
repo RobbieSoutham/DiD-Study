@@ -427,7 +427,7 @@ def print_att_pooled_block(
             lo=lo,
             hi=hi,
             bins_df=att_bins,
-            title="ATT$^{o}$ (long-diff + by bin)",
+            title=r"ATT$^{\circ}$ (long-diff + by bin)",
             ylabel="Effect (Deltalog units)",
         )
     else:
@@ -435,7 +435,7 @@ def print_att_pooled_block(
             coef=coef,
             lo=lo,
             hi=hi,
-            title="ATT$^{o}$ (long-diff)",
+            title=r"ATT$^{\circ}$ (long-diff)",
             ylabel="Effect (Deltalog units)",
         )
 
@@ -455,13 +455,12 @@ def print_att_test_block(att_test: Optional[Dict[str, Any]]) -> None:
     se_txt = f"{se:.3f}" if np.isfinite(se) else "NA"
     p_txt = _fmt_p(p)
 
-    pw = att_test.get("p_wcb", None)
-    if pw is None:
-        pw = att_test.get("p_boot", att_test.get("p_bootstrap", None))
-    pw_txt = _fmt_p(pw) if pw is not None else "NA"
+    p_boot = att_test.get("p_boot", att_test.get("p_bootstrap", None))
+    p_boot_txt = _fmt_p(p_boot) if p_boot is not None else "NA"
 
     print(
-        f"\nATT^o (differences package, 'test' ATT^o): {att:.3f} (SE={se_txt}, p={p_txt}, WCB p={pw_txt})"
+        f"\nATT^o (differences package, 'test' ATT^o): {att:.3f} "
+        f"(SE={se_txt}, p={p_txt}, ordinary bootstrap p={p_boot_txt})"
     )
 
     event_agg = att_test['attgt_obj'].aggregate(
@@ -751,14 +750,15 @@ def print_overall_support(
             att_val = float(att_test.get("att_overall", np.nan))
             se_t = float(att_test.get("se_overall", np.nan))
             p_t = att_test.get("p_overall", np.nan)
-            p_wcb_t = att_test.get("p_wcb", att_test.get("p_boot", None))
+            p_boot_t = att_test.get("p_boot", None)
             ncl_t = att_test.get("n_clusters", None)
 
             p_t_stars = _fmt_p_with_stars(p_t)
-            pw_t_stars = _fmt_p_with_stars(p_wcb_t) if p_wcb_t is not None else "NA"
+            p_boot_t_stars = _fmt_p_with_stars(p_boot_t) if p_boot_t is not None else "NA"
 
             print(
-                f"  Estimate: {att_val:.4f} (p = {p_t_stars}, WCB/boot p = {pw_t_stars})"
+                f"  Estimate: {att_val:.4f} "
+                f"(p = {p_t_stars}, ordinary bootstrap p = {p_boot_t_stars})"
             )
 
             # MDE for differences estimator (compute if not provided)
@@ -1045,7 +1045,7 @@ def study_printable_from_didstudy(results: Any) -> StudyPrintable:
     if att_test_obj is not None:
         try:
             if isinstance(att_test_obj, dict):
-                for k in ("att_overall", "se_overall", "p_overall", "p_wcb", "p_boot"):
+                for k in ("att_overall", "se_overall", "p_overall", "p_boot"):
                     if k in att_test_obj:
                         att_test[k] = att_test_obj[k]
                 used = att_test_obj.get("used", None)
@@ -1055,7 +1055,6 @@ def study_printable_from_didstudy(results: Any) -> StudyPrintable:
                     "att_overall": getattr(att_test_obj, "att_overall", np.nan),
                     "se_overall": getattr(att_test_obj, "se_overall", np.nan),
                     "p_overall": getattr(att_test_obj, "p_overall", np.nan),
-                    "p_wcb": getattr(att_test_obj, "p_wcb", None),
                     "p_boot": getattr(att_test_obj, "p_boot", None),
                 }
                 used = getattr(att_test_obj, "used", None)
@@ -1309,7 +1308,7 @@ def print_and_plot_summary(
         }
         binned_df = sp.att_bins[["bin", "coef", "lo", "hi"]].copy()
         es_df = sp.es_pooled.copy()
-        plot_att_combo(pooled, binned_df, es_df, suptitle="ATT$^{o}$ summary")
+        plot_att_combo(pooled, binned_df, es_df, suptitle=r"ATT$^{\circ}$ summary")
 
     
 
@@ -1512,4 +1511,4 @@ class StudyReporter:
             }
             binned_df = self.sp.att_bins[["bin", "coef", "lo", "hi"]].copy()
             es_df = self.sp.es_pooled.copy()
-            plot_att_combo(pooled, binned_df, es_df, suptitle="ATT$^{o}$ summary")
+            plot_att_combo(pooled, binned_df, es_df, suptitle=r"ATT$^{\circ}$ summary")

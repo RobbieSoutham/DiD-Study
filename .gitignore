@@ -15,6 +15,7 @@ __pycache__/
 *$py.class
 
 # Virtual environments
+.venv
 .venv/
 venv/
 new_venv/
@@ -98,6 +99,7 @@ reports/
 tmp/
 temp/
 .cache/
+results_backup_pre_rerun_*/
 
 ########################
 # Logs
